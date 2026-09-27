@@ -12,6 +12,8 @@
 
 ## Global Constraints
 
+- First complete `docs/superpowers/plans/2026-09-27-local-setup-and-athena-bootstrap.md` and require `bin/validate-setup` to report `READY`. Use the validated `<data-root>/athena_input/current` directory as `ATHENA_FILES_DIR`.
+- Keep every generated spike artifact, including scratch PostgreSQL state, below `<data-root>/work/fhir_to_cdm_spike/`; do not create generated state in the tracked repository tree.
 - This is a pre-development feasibility spike. Everything under `spikes/fhir_to_cdm/` is non-production and disposable except the final report.
 - Use Synthea tag `v3.3.0` and record the resolved full commit SHA and release-asset SHA-256 in the report.
 - Use upstream OHDSI FhirToCdm commit `4991f90` and record the resolved full commit SHA in the report.
@@ -19,7 +21,7 @@
 - A wrapper Dockerfile, entrypoint, loader, and validation queries are allowed; changes to converter behavior are not.
 - Test `linux/amd64` and record emulation if the host is not amd64.
 - Use OMOP output mode `V53` and test loading against OMOP CDM 5.3.1.
-- Use an actual Athena vocabulary export. Never commit Athena files, database data, generated patients, passwords, or generated CDM files.
+- Use an actual Athena vocabulary export containing its nine standard CSV files. Create `source_to_concept_map` empty because it is a site-maintained OMOP table and is not part of a standard Athena download. Never commit Athena files, database data, generated patients, passwords, or generated CDM files.
 - Generate two batches of five patients with seeds `8675309` and `8675310` and reference date `2024-01-01`.
 - Configure Synthea to use UUID filenames so files from separate batches can be flattened without collisions.
 - Test Synthea FHIR R4 JSON Bundles and STU3 JSON Bundles independently. Do not test NDJSON: upstream FhirToCdm enumerates top-level `*.json` files and casts each root resource to `Bundle`.
@@ -61,7 +63,7 @@ spikes/fhir_to_cdm/
 └── REPORT.md
 ```
 
-Generated state belongs under `spikes/fhir_to_cdm/work/` and is ignored by Git.
+Generated state belongs under `<data-root>/work/fhir_to_cdm_spike/` and is ignored by Git. Mount that directory at `/work` in spike containers.
 
 ---
 
@@ -76,7 +78,7 @@ Generated state belongs under `spikes/fhir_to_cdm/work/` and is ignored by Git.
 - Create: `spikes/fhir_to_cdm/REPORT.md`
 
 **Interfaces:**
-- Consumes: Docker Engine with Compose and a host path containing the ten Athena export files.
+- Consumes: Docker Engine with Compose and a host path containing the nine standard Athena export files.
 - Produces: A validated spike configuration and report template.
 
 - [ ] **Step 1: Write prerequisite checks**
@@ -84,14 +86,14 @@ Generated state belongs under `spikes/fhir_to_cdm/work/` and is ignored by Git.
 `check-prerequisites` must fail unless:
 
 ```text
+the repository-level bin/validate-setup command reports READY
 docker and docker compose are available
 the Docker daemon is reachable
 the configured platform is linux/amd64
 ATHENA_FILES_DIR is an absolute readable directory
 CONCEPT.csv, CONCEPT_ANCESTOR.csv, CONCEPT_CLASS.csv,
 CONCEPT_RELATIONSHIP.csv, CONCEPT_SYNONYM.csv, DOMAIN.csv,
-DRUG_STRENGTH.csv, RELATIONSHIP.csv, SOURCE_TO_CONCEPT_MAP.csv,
-and VOCABULARY.csv all exist
+DRUG_STRENGTH.csv, RELATIONSHIP.csv, and VOCABULARY.csv all exist
 no plaintext database password is tracked by Git
 ```
 
@@ -114,10 +116,9 @@ SYNTHEA_CLINICIAN_SEED_2=9675310
 SYNTHEA_REFERENCE_DATE=20240101
 FHIR_TO_CDM_REF=4991f90
 OMOP_CDM_VERSION=5.3.1
-ATHENA_FILES_DIR=/absolute/path/to/unpacked/athena
 ```
 
-The real password belongs only in ignored `.env` or a Compose secret.
+The spike wrapper must read the canonical `DATA_ROOT` from the repository-level ignored `etc/setup.env`, derive `ATHENA_FILES_DIR="$DATA_ROOT/athena_input/current"`, and export both values to Compose. Do not duplicate paths in the spike configuration. The real password belongs only in ignored `.env` or a Compose secret.
 
 - [ ] **Step 3: Define report sections before experiments**
 
@@ -220,7 +221,7 @@ git commit -m "spike: package unmodified OHDSI FhirToCdm"
 
 **Interfaces:**
 - Consumes: Synthea 3.3.0, fixed seeds, and fixed reference date.
-- Produces: `work/batches/{batch_001,batch_002}/{r4,stu3}` and `work/assembled/{r4,stu3}`.
+- Produces: `/work/batches/{batch_001,batch_002}/{r4,stu3}` and `/work/assembled/{r4,stu3}` inside `<data-root>/work/fhir_to_cdm_spike/`.
 
 - [ ] **Step 1: Write the failing input validation**
 
@@ -289,16 +290,16 @@ git commit -m "spike: generate deterministic FHIR fixtures"
 - Modify: `spikes/fhir_to_cdm/REPORT.md`
 
 **Interfaces:**
-- Consumes: The ten Athena files.
+- Consumes: The nine standard Athena CSV files.
 - Produces: Physical vocabulary tables in `athena_vocabs` readable through PostgreSQL ODBC.
 
 - [ ] **Step 1: Create isolated spike schemas**
 
 Create only `athena_vocabs`, `spike_omop_fhir_r4`, and `spike_omop_fhir_stu3` inside the Compose PostgreSQL database.
 
-- [ ] **Step 2: Load all ten vocabulary tables**
+- [ ] **Step 2: Populate the complete vocabulary-table surface**
 
-Use OMOP 5.3.1 definitions and PostgreSQL `\copy` with Athena's tab delimiter and header. Fail on a missing file, rejected row, or type error.
+Use OMOP 5.3.1 definitions and PostgreSQL `\copy` with Athena's tab delimiter and header. Load the nine exported tables and create `source_to_concept_map` empty. Fail on a missing exported file, rejected row, or type error; do not require a non-standard `SOURCE_TO_CONCEPT_MAP.csv`.
 
 - [ ] **Step 3: Verify vocabulary completeness**
 

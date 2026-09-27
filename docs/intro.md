@@ -197,6 +197,12 @@ source_to_concept_map
 vocabulary
 ```
 
+A standard Athena download supplies nine CSV files. It does not supply
+`SOURCE_TO_CONCEPT_MAP.csv`; `source_to_concept_map` is a site-maintained OMOP
+table. Setup creates that tenth physical table empty so software expecting the
+complete OMOP vocabulary-table surface can query it. Future local mappings may
+populate it through a separate controlled process.
+
 The target schemas exist before the vocabulary job runs, and their CDM
 initialization does not create physical tables with these names. The
 `etl_synthea` workflow skips `LoadVocabFromSchema`; its database role can read
@@ -353,6 +359,10 @@ directories directly to the two inboxes.
 
 ## 12. Left for implementation planning
 
+- Implement and run the local setup and Athena bootstrap documented in
+  `docs/superpowers/plans/2026-09-27-local-setup-and-athena-bootstrap.md`.
+  Its `bin/validate-setup` command must report `READY` before the converter
+  spike begins.
 - Execute the pre-development FhirToCdm container feasibility spike documented
   in `docs/superpowers/plans/2026-09-27-fhir-to-cdm-container-feasibility-spike.md`.
 - After the spike, record the verified FhirToCdm commit, FHIR format, runtime
