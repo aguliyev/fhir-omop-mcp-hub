@@ -1,0 +1,5 @@
+#!/bin/bash
+# Stop this Compose project (Task 2).
+set -eu
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"$ROOT/compose" stop "$@"

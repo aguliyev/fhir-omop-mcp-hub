@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# bin/validate-vocab: read-only validation of the committed Athena load.
+# Runs db/athena/validate.sql without modifying vocabulary data.
+# Exits nonzero on any assertion failure.
+#
+# Integration assumptions: see bin/load-vocab header (bin/lib/common.sh for
+# REPO_ROOT/DATA_ROOT/die; bin/compose forwarding to docker compose with a
+# healthy `postgres` service holding db/athena/validate.sql).
+set -eu
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+
+if [ -f "$REPO_ROOT/bin/lib/common.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$REPO_ROOT/bin/lib/common.sh"
+fi
+if ! command -v die >/dev/null 2>&1; then
+  die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+fi
+if [ -z "${DATA_ROOT:-}" ]; then
+  if [ -f "$REPO_ROOT/etc/setup.env" ]; then
+    # shellcheck disable=SC1091
+    . "$REPO_ROOT/etc/setup.env"
+  fi
+  DATA_ROOT="${DATA_ROOT:-$REPO_ROOT/data}"
+fi
+case "$DATA_ROOT" in
+  /*) ;;
+  *) DATA_ROOT="$REPO_ROOT/$DATA_ROOT" ;;
+esac
+
+COMPOSE_BIN="$REPO_ROOT/bin/compose"
+# Prefer bin/lib/common.sh's compose() (owns --file/--project flags).
+# Fallback only when common.sh is absent (concurrent Task 1).
+if ! command -v compose >/dev/null 2>&1; then
+  compose() {
+    if [ -x "$COMPOSE_BIN" ]; then
+      "$COMPOSE_BIN" "$@"
+    else
+      docker compose "$@"
+    fi
+  }
+fi
+
+[ -f "$REPO_ROOT/db/athena/validate.sql" ] \
+  || die "missing db/athena/validate.sql"
+
+STAGED="$DATA_ROOT/athena_input/current"
+STAGED_AGG=""
+# The reported staged checksum is provenance only: show it solely when the
+# shared helper proves the staged manifest (readiness comparison itself is
+# owned by the lifecycle agent). An unproven manifest reports NULL rather
+# than an untrusted value; committed-state validation below still runs.
+if [ -f "$STAGED/manifest.sha256" ]; then
+  if [ -f "$REPO_ROOT/db/athena/verify_manifest.sh" ] \
+    && sh "$REPO_ROOT/db/athena/verify_manifest.sh" "$STAGED"; then
+    STAGED_AGG="$(awk '{print $1}' "$STAGED/manifest.sha256" | LC_ALL=C sort | sha256sum | awk '{print $1}')"
+  else
+    printf 'warning: staged manifest at %s is missing its verifier or fails proof; reporting NULL staged checksum\n' "$STAGED" >&2
+  fi
+fi
+
+compose exec -T postgres pg_isready -U "${POSTGRES_USER:-postgres}" \
+  -d "${POSTGRES_DB:-fhir_omop_mcp_hub}" >/dev/null \
+  || die "postgres is not healthy (bin/start first)"
+
+# Read-only: validate.sql contains only SELECTs and DO ... RAISE checks.
+# Probe once for an in-container copy (single execution, full error output);
+# otherwise stream the host file over stdin. `exec -T` forwards stdin.
+SET_ARG=""
+if [ -n "$STAGED_AGG" ]; then
+  esc="$(printf '%s' "$STAGED_AGG" | sed "s/'/''/g")"
+  SET_ARG="SET athena.staged_checksum = '$esc';"
+fi
+if compose exec -T postgres test -f /repo/db/athena/validate.sql 2>/dev/null; then
+  if [ -n "$SET_ARG" ]; then
+    compose exec -T postgres psql -U "${POSTGRES_USER:-postgres}" \
+      -d "${POSTGRES_DB:-fhir_omop_mcp_hub}" -v ON_ERROR_STOP=1 \
+      -c "$SET_ARG" -f /repo/db/athena/validate.sql
+  else
+    compose exec -T postgres psql -U "${POSTGRES_USER:-postgres}" \
+      -d "${POSTGRES_DB:-fhir_omop_mcp_hub}" -v ON_ERROR_STOP=1 \
+      -f /repo/db/athena/validate.sql
+  fi
+else
+  if [ -n "$SET_ARG" ]; then
+    compose exec -T postgres psql -U "${POSTGRES_USER:-postgres}" \
+      -d "${POSTGRES_DB:-fhir_omop_mcp_hub}" -v ON_ERROR_STOP=1 \
+      -c "$SET_ARG" <"$REPO_ROOT/db/athena/validate.sql"
+  else
+    compose exec -T postgres psql -U "${POSTGRES_USER:-postgres}" \
+      -d "${POSTGRES_DB:-fhir_omop_mcp_hub}" -v ON_ERROR_STOP=1 \
+      <"$REPO_ROOT/db/athena/validate.sql"
+  fi
+fi

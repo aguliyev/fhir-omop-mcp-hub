@@ -1,0 +1,5 @@
+#!/bin/bash
+# Compose wrapper (Task 2). Owns all Compose flags; start/stop/status/logs call this.
+set -eu
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/lib" && pwd)/common.sh"
+compose "$@"

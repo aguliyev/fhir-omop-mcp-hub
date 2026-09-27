@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- First complete `docs/superpowers/plans/2026-09-27-local-setup-and-athena-bootstrap.md` and require `bin/validate-setup` to report `READY`. Use the validated `<data-root>/athena_input/current` directory as `ATHENA_FILES_DIR`.
+- First complete `docs/superpowers/plans/2026-09-27-local-setup-and-athena-bootstrap.md` and require `bin/validate-setup` to report `READY`. Use the validated absolute `<data-root>/athena_input/current` directory as `ATHENA_FILES_DIR` and require its staged `manifest.sha256`. The Athena prerequisite is nine exported files plus an empty `source_to_concept_map`; keep the isolated scratch load so spike experiments cannot damage the canonical vocabulary schema. Scratch validation must still confirm the five required vocabulary families (SNOMED, RxNorm, LOINC, CVX, UCUM) have valid standard concepts.
 - Keep every generated spike artifact, including scratch PostgreSQL state, below `<data-root>/work/fhir_to_cdm_spike/`; do not create generated state in the tracked repository tree.
 - This is a pre-development feasibility spike. Everything under `spikes/fhir_to_cdm/` is non-production and disposable except the final report.
 - Use Synthea tag `v3.3.0` and record the resolved full commit SHA and release-asset SHA-256 in the report.
@@ -94,6 +94,7 @@ ATHENA_FILES_DIR is an absolute readable directory
 CONCEPT.csv, CONCEPT_ANCESTOR.csv, CONCEPT_CLASS.csv,
 CONCEPT_RELATIONSHIP.csv, CONCEPT_SYNONYM.csv, DOMAIN.csv,
 DRUG_STRENGTH.csv, RELATIONSHIP.csv, and VOCABULARY.csv all exist
+staged manifest.sha256 exists in ATHENA_FILES_DIR alongside the nine CSVs
 no plaintext database password is tracked by Git
 ```
 
@@ -309,12 +310,27 @@ Run:
 SELECT count(*) > 0 FROM athena_vocabs.concept;
 SELECT count(*) > 0 FROM athena_vocabs.concept_relationship;
 SELECT count(*) > 0 FROM athena_vocabs.concept_ancestor;
+SELECT count(*) > 0 FROM athena_vocabs.concept_class;
+SELECT count(*) > 0 FROM athena_vocabs.concept_synonym;
+SELECT count(*) > 0 FROM athena_vocabs.domain;
+SELECT count(*) > 0 FROM athena_vocabs.drug_strength;
+SELECT count(*) > 0 FROM athena_vocabs.relationship;
+SELECT count(*) > 0 FROM athena_vocabs.vocabulary;
+SELECT count(*) = 0 FROM athena_vocabs.source_to_concept_map;
 SELECT count(*) = 1
 FROM athena_vocabs.vocabulary
 WHERE vocabulary_id = 'None';
+SELECT count(*) = 5
+FROM athena_vocabs.vocabulary
+WHERE vocabulary_id IN ('SNOMED', 'RxNorm', 'LOINC', 'CVX', 'UCUM');
+SELECT count(DISTINCT c.vocabulary_id) = 5
+FROM athena_vocabs.concept c
+WHERE c.vocabulary_id IN ('SNOMED', 'RxNorm', 'LOINC', 'CVX', 'UCUM')
+  AND c.standard_concept = 'S'
+  AND c.invalid_reason IS NULL;
 ```
 
-Record every table count and `vocabulary_version`.
+Record every table count, `vocabulary_version`, and the five-family standard-concept check.
 
 - [ ] **Step 4: Verify ODBC from the converter image**
 

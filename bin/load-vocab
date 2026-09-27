@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# bin/load-vocab: guarded operator entrypoint for the Athena vocabulary load.
+# Requires healthy postgres + valid staged manifest. If live vocabulary data
+# exists, requires --replace and interactive YES confirmation. Thin wrapper:
+# the load itself runs inside the `athena_vocabs` one-shot container via
+# db/athena/load.sh. Sanitized logs (no secrets) go to <data-root>/work/setup/.
+#
+# Integration assumptions (bin/lib/common.sh + bin/compose are owned by
+# parallel tasks; see return notes):
+#   - bin/lib/common.sh provides REPO_ROOT, DATA_ROOT (canonical absolute),
+#     die(), require_command(); ignored etc/setup.env already loaded.
+#   - bin/compose forwards args to `docker compose` for this project.
+#   - services: postgres (pg_isready healthy), one-shot athena_vocabs whose
+#     image mounts db/athena + /data and injects VOCAB_VIEW_TARGET_SCHEMAS.
+set -eu
+set -o pipefail 2>/dev/null || true  # bash: fail on masked pipeline errors
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+
+# Shared helpers when available (concurrent Task 1); local fallbacks otherwise.
+if [ -f "$REPO_ROOT/bin/lib/common.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$REPO_ROOT/bin/lib/common.sh"
+fi
+if ! command -v die >/dev/null 2>&1; then
+  die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+fi
+if [ -z "${DATA_ROOT:-}" ]; then
+  if [ -f "$REPO_ROOT/etc/setup.env" ]; then
+    # shellcheck disable=SC1091
+    . "$REPO_ROOT/etc/setup.env"
+  fi
+  DATA_ROOT="${DATA_ROOT:-$REPO_ROOT/data}"
+fi
+case "$DATA_ROOT" in
+  /*) ;;
+  *) DATA_ROOT="$REPO_ROOT/$DATA_ROOT" ;;
+esac
+
+COMPOSE_BIN="$REPO_ROOT/bin/compose"
+# Prefer bin/lib/common.sh's compose() (owns --file/--project flags).
+# Fallback only when common.sh is absent (concurrent Task 1).
+if ! command -v compose >/dev/null 2>&1; then
+  compose() {
+    if [ -x "$COMPOSE_BIN" ]; then
+      "$COMPOSE_BIN" "$@"
+    else
+      docker compose "$@"
+    fi
+  }
+fi
+
+REPLACE=0
+for a in "$@"; do
+  case "$a" in
+    --replace) REPLACE=1 ;;
+    -h|--help)
+      printf 'usage: bin/load-vocab [--replace]\n'; exit 0 ;;
+    *) die "unknown argument: $a (usage: bin/load-vocab [--replace])" ;;
+  esac
+done
+
+command -v sha256sum >/dev/null 2>&1 || die "sha256sum not found"
+STAGED="$DATA_ROOT/athena_input/current"
+[ -d "$STAGED" ] || die "no staged Athena export at $STAGED (run bin/stage-athena first)"
+[ -f "$STAGED/manifest.sha256" ] || die "staged manifest missing: $STAGED/manifest.sha256"
+# Staged-manifest proof via the shared db/athena/verify_manifest.sh helper
+# (3-field "<sha256> <bytes> <basename>" lines; sha256sum -c cannot parse
+# them). Executed with the host shell; aggregate below stays
+# sha256-of-sorted-hashes to match Task 5.
+VERIFY_HELPER="$REPO_ROOT/db/athena/verify_manifest.sh"
+[ -f "$VERIFY_HELPER" ] || die "helper missing: $VERIFY_HELPER"
+sh "$VERIFY_HELPER" "$STAGED" \
+  || die "staged manifest verification failed for $STAGED/manifest.sha256"
+STAGED_AGG="$(awk '{print $1}' "$STAGED/manifest.sha256" | LC_ALL=C sort | sha256sum | awk '{print $1}')"
+# Staged vocabulary versions, read by header position from the staged
+# VOCABULARY.csv (tab-delimited). No eval, no fixed column positions.
+STAGED_VER="$(awk -F'\t' '
+  NR==1 { for (i=1; i<=NF; i++) { if ($i=="vocabulary_id") id=i; if ($i=="vocabulary_version") ver=i }
+          if (!id || !ver) { print "BAD_HEADER" > "/dev/stderr"; exit 1 } next }
+  { print $id": "$ver }' "$STAGED/VOCABULARY.csv" 2>/dev/null | LC_ALL=C sort -u | tr '\n' ';')" \
+  || die "cannot read staged versions from $STAGED/VOCABULARY.csv (unexpected header)"
+
+# Database health: postgres must accept connections.
+# stdin from /dev/null: `exec -T` forwards our stdin to the container, so a
+# piped YES intended for the confirmation below must not be drained here.
+compose exec -T postgres pg_isready -U "${POSTGRES_USER:-postgres}" \
+  -d "${POSTGRES_DB:-fhir_omop_mcp_hub}" >/dev/null </dev/null \
+  || die "postgres is not healthy (bin/start first)"
+
+# Live state: any rows in athena_vocabs.concept means a previous load exists.
+# Both probes read stdin from /dev/null so piped confirmation input survives.
+# NOTE: string_agg(DISTINCT ...) requires ORDER BY on the aggregated
+# expression itself; positional ORDER BY 1 errors out.
+LIVE_COUNT="$(compose exec -T postgres psql -U "${POSTGRES_USER:-postgres}" \
+  -d "${POSTGRES_DB:-fhir_omop_mcp_hub}" -tAc \
+  "SELECT count(*) FROM athena_vocabs.concept;" </dev/null 2>/dev/null || printf 'NA')"
+LIVE_VER="$(compose exec -T postgres psql -U "${POSTGRES_USER:-postgres}" \
+  -d "${POSTGRES_DB:-fhir_omop_mcp_hub}" -tAc \
+  "SELECT string_agg(DISTINCT vocabulary_version, ' | ' ORDER BY vocabulary_version) FROM athena_vocabs.vocabulary;" </dev/null 2>/dev/null || printf 'none')"
+case "$LIVE_COUNT" in ''|'NA') LIVE_COUNT=0 ;; esac
+
+if [ "$LIVE_COUNT" != "0" ] && [ "$REPLACE" != "1" ]; then
+  printf 'live vocabulary exists (concept rows=%s)\n live versions: %s\n staged versions: %s\n staged aggregate=%s\n' \
+    "$LIVE_COUNT" "$LIVE_VER" "$STAGED_VER" "$STAGED_AGG" >&2
+  die "refusing to replace live vocabulary without --replace"
+fi
+# Any replacement of live data requires explicit interactive confirmation.
+# There is intentionally no --yes/--force bypass (plan stop rule: stop before
+# replacement until the user approves --replace after seeing both versions).
+if [ "$LIVE_COUNT" != "0" ]; then
+  printf 'current vocabulary: rows=%s versions: %s\n' "$LIVE_COUNT" "$LIVE_VER" >&2
+  printf 'staged  vocabulary: versions: %s\n staged aggregate=%s dir=%s\n' "$STAGED_VER" "$STAGED_AGG" "$STAGED" >&2
+  printf 'Type YES to replace the live athena_vocabs schema: ' >&2
+  read -r reply
+  [ "$reply" = "YES" ] || die "aborted (confirmation required)"
+fi
+
+LOGDIR="$DATA_ROOT/work/setup"
+mkdir -p "$LOGDIR"
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+LOG="$LOGDIR/load-vocab-$TS.log"
+printf 'load-vocab started %s staged=%s aggregate=%s replace=%s\n' "$TS" "$STAGED" "$STAGED_AGG" "$REPLACE" | tee "$LOG"
+# Service name/flags owned by the Compose task; `run --rm` keeps this one-shot.
+# No pipe here: in POSIX sh a pipeline returns the last command's status,
+# which would mask a loader failure.
+if compose run --rm athena_vocabs </dev/null >"$LOG.run" 2>&1; then
+  cat "$LOG.run" >>"$LOG"; rm -f "$LOG.run"
+  printf 'LOAD_OK log=%s\n' "$LOG" | tee -a "$LOG"
+else
+  rc=$?
+  cat "$LOG.run" >>"$LOG"; rm -f "$LOG.run"
+  die "load-vocab failed (exit $rc); prior schema preserved; see $LOG"
+fi

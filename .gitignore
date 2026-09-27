@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local setup state (Task 1): generated data root, local env, compose env
+/data
+/etc/setup.env
+/.env

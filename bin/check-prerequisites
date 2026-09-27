@@ -1,0 +1,94 @@
+#!/bin/bash
+# Host preflight for local setup (Task 1). One PASS:/FAIL: line per check.
+set -eu
+
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/lib" && pwd)/common.sh"
+
+fail=0
+pass() { printf 'PASS: %s\n' "$1"; }
+nope() { printf 'FAIL: %s\n' "$1"; fail=1; }
+
+PINNED_IMAGE="docker.io/library/postgres:16.4-alpine@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c"
+
+if command -v docker >/dev/null 2>&1; then pass "docker command available ($(docker --version 2>/dev/null || echo docker))"; else nope "docker command missing -- install Docker Engine and retry"; fi
+if docker compose version >/dev/null 2>&1; then pass "docker compose plugin available"; else nope "docker compose plugin missing -- install the Compose v2 plugin and retry"; fi
+if docker info >/dev/null 2>&1; then pass "docker daemon reachable"; else nope "docker daemon unreachable -- start Docker and retry"; fi
+if [ "$(uname -s)" = "Linux" ]; then pass "host OS is Linux"; else nope "host OS is $(uname -s), expected Linux"; fi
+if [ "$(uname -m)" = "x86_64" ]; then pass "host arch is x86_64"; else nope "host arch is $(uname -m), expected x86_64"; fi
+for t in openssl sha256sum awk sed find; do
+  if command -v "$t" >/dev/null 2>&1; then pass "required tool '$t' available"; else nope "required tool '$t' missing -- install it and retry"; fi
+done
+
+# 30 GiB free on the data-root filesystem (M3): measure the nearest existing
+# ancestor, since the data root itself may not exist yet in check mode.
+dfdir="$DATA_ROOT"
+while [ ! -e "$dfdir" ] && [ "$dfdir" != "/" ]; do dfdir="$(dirname "$dfdir")"; done
+if avail_kb="$(df -k "$dfdir" 2>/dev/null | awk 'NR==2{print $4}')"; [ -n "${avail_kb:-}" ] && [ "$avail_kb" -ge 31457280 ] 2>/dev/null; then
+  pass "disk free >= 30 GiB ($((avail_kb / 1024 / 1024)) GiB avail on $dfdir)"
+else
+  nope "disk free < 30 GiB on the data-root filesystem ($dfdir) -- free space and retry"
+fi
+
+# Loopback port: free, or held by this exact Compose project's postgres
+# (idempotent rerun after start/setup). Any other occupier fails.
+if (exec 3<>"/dev/tcp/127.0.0.1/${POSTGRES_HOST_PORT}") >/dev/null 2>&1; then
+  exec 3>&- 3<&- || true
+  self_bound=0
+  for cid in $(compose ps -q postgres 2>/dev/null); do
+    mapping="$(docker inspect -f '{{range $p,$b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}:{{.HostPort}} {{end}}{{end}}' "$cid" 2>/dev/null || true)"
+    case " $mapping " in
+      *" 127.0.0.1:${POSTGRES_HOST_PORT} "*) self_bound=1 ;;
+    esac
+  done
+  if [ "$self_bound" -eq 1 ]; then
+    pass "loopback port ${POSTGRES_HOST_PORT} is held by this project's postgres (idempotent rerun)"
+  else
+    nope "host port ${POSTGRES_HOST_PORT} on 127.0.0.1 is in use by another process -- stop it or set POSTGRES_HOST_PORT to a free port and retry"
+  fi
+else
+  pass "loopback port ${POSTGRES_HOST_PORT} is free"
+fi
+
+# Data root: DATA_ROOT is already symlink/..-resolved by common.sh, so the
+# denylist below sees the real path (H3). Check mode never creates anything
+# (M4): an absent root passes when its nearest existing ancestor is writable.
+HOME_RESOLVED="$(resolve_path "${HOME:-/nonexistent-home}")"
+if [ "$DATA_ROOT" = "/" ] || [ "$DATA_ROOT" = "$HOME_RESOLVED" ] || [ "$DATA_ROOT" = "$REPO_ROOT" ]; then
+  nope "data root $DATA_ROOT rejected (must not be /, the home directory, or the repository root) -- set DATA_ROOT to an allowed absolute path"
+elif [ -e "$DATA_ROOT" ] && [ ! -d "$DATA_ROOT" ]; then
+  nope "data root $DATA_ROOT exists and is not a directory -- set DATA_ROOT to a directory path"
+elif [ -d "$DATA_ROOT" ]; then
+  if [ -w "$DATA_ROOT" ]; then
+    pass "data root $DATA_ROOT exists and is writable"
+  else
+    nope "data root $DATA_ROOT is not writable -- fix permissions and retry"
+  fi
+else
+  anc="$DATA_ROOT"
+  while [ ! -e "$anc" ] && [ "$anc" != "/" ]; do anc="$(dirname "$anc")"; done
+  if [ -d "$anc" ] && [ -w "$anc" ]; then
+    pass "data root $DATA_ROOT is allowed (ancestor $anc writable; prepare-data will create it)"
+  else
+    nope "data root $DATA_ROOT cannot be created under $anc -- fix permissions and retry"
+  fi
+fi
+
+# Pinned image digest.
+if [ "$POSTGRES_IMAGE" = "$PINNED_IMAGE" ] && grep -F -q -- "$PINNED_IMAGE" "$REPO_ROOT/compose.yaml" 2>/dev/null; then
+  pass "postgres image is pinned ($PINNED_IMAGE)"
+else
+  nope "postgres image must be exactly $PINNED_IMAGE in etc/setup.env and compose.yaml"
+fi
+
+# Ignored state must not be tracked.
+if [ -z "$(git -C "$REPO_ROOT" ls-files -- data etc/setup.env .env 2>/dev/null)" ]; then
+  pass "generated state is untracked (data, etc/setup.env, .env)"
+else
+  nope "generated state is tracked by git -- remove it from the index: $(git -C "$REPO_ROOT" ls-files -- data etc/setup.env .env | tr '\n' ' ')"
+fi
+for p in data etc/setup.env .env; do
+  if git -C "$REPO_ROOT" check-ignore -q "$p" 2>/dev/null; then pass "git ignores $p"; else nope "git does not ignore $p -- fix .gitignore and retry"; fi
+done
+
+if [ "$fail" -ne 0 ]; then printf 'preflight: FAILED\n' >&2; exit 1; fi
+printf 'preflight: PASSED\n'

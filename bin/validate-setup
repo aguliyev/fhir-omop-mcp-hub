@@ -1,0 +1,120 @@
+#!/bin/sh
+# bin/validate-setup — read-only readiness validation (Task 5).
+# Reruns preflight + idempotent db_init, checks container health, runs
+# read-only bin/validate-vocab, verifies staged file bytes field-by-field
+# (the 3-field manifest is not sha256sum -c compatible), and requires the
+# staged aggregate, the live `athena_staged_checksum` schema comment, and the
+# readiness marker to agree. Honors $READY_ENV_OVERRIDE to gate an unpublished
+# temporary marker (used by bin/setup so no READY state is observable before
+# verification passes).
+# The host loaded file is advisory only: when present it must agree, when
+# absent the live proof suffices. Never loads or modifies vocabulary data.
+# Prints vocabulary versions, row counts, and server version. Removes a stale
+# readiness marker on any failure so a FAILED state is never reported READY.
+# Version queries use passwordless local-socket psql inside the container
+# (same as bin/validate-vocab); this script never handles secrets.
+set -eu
+
+REPO_ROOT="${REPO_ROOT:-$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)}"
+# Allow-listed env-wins loader (mirrors bin/lib/common.sh, which is bash-only).
+load_setup_env() {
+  _f="$REPO_ROOT/etc/setup.env"
+  [ -f "$_f" ] || return 0
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    case "$_line" in ''|'#'*) continue ;; esac
+    _k="${_line%%=*}"
+    case "$_k" in
+      COMPOSE_PROJECT_NAME|DATA_ROOT|POSTGRES_IMAGE|POSTGRES_DB|POSTGRES_USER|POSTGRES_HOST_PORT|VOCAB_VIEW_TARGET_SCHEMAS) ;;
+      *) continue ;;
+    esac
+    eval "_set=\${${_k}+x}"
+    if [ -z "${_set:-}" ]; then
+      _val="${_line#*=}"
+      case "$_val" in
+        '"'*'"') _val="${_val#\"}"; _val="${_val%\"}" ;;
+        "'"*"'") _val="${_val#\'}"; _val="${_val%\'}"; ;;
+      esac
+      export "${_k}=${_val}"
+    fi
+  done <"$_f"
+  unset _f _line _k _set _val
+}
+if [ -n "${BASH_VERSION:-}" ] && [ -f "$REPO_ROOT/bin/lib/common.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$REPO_ROOT/bin/lib/common.sh"
+else
+  load_setup_env
+fi
+if ! command -v die >/dev/null 2>&1; then
+  die() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+fi
+
+raw="${DATA_ROOT:-$REPO_ROOT/data}"
+case "$raw" in
+  /*) DATA_ROOT="$raw";;
+  *) DATA_ROOT="$REPO_ROOT/$raw";;
+esac
+[ -d "$DATA_ROOT" ] || die "data root $DATA_ROOT missing; run bin/setup first"
+DATA_ROOT="$(CDPATH= cd -- "$DATA_ROOT" && pwd -P)"
+DB_NAME="${POSTGRES_DB:-fhir_omop_mcp_hub}"
+STAGED_DIR="$DATA_ROOT/athena_input/current"
+STAGED_MANIFEST="$STAGED_DIR/manifest.sha256"
+LOADED_FILE="$DATA_ROOT/work/setup/loaded_athena.sha256"
+READY_ENV="${READY_ENV_OVERRIDE:-$DATA_ROOT/work/setup/ready.env}"
+
+invalidate() {
+  printf 'FAIL: %s\n' "$1" >&2
+  rm -f "$READY_ENV"
+  exit 1
+}
+
+dbq() {
+  "$REPO_ROOT/bin/compose" exec -T postgres \
+    psql -U "${POSTGRES_USER:-postgres}" -d "$DB_NAME" -v ON_ERROR_STOP=1 -tAc "$1"
+}
+
+live_schema_checksum() {
+  # Live proof committed by db/athena/load.sh; empty means nothing committed.
+  "$REPO_ROOT/bin/compose" exec -T postgres \
+    psql -U "${POSTGRES_USER:-postgres}" -d "$DB_NAME" -v ON_ERROR_STOP=1 -tAc \
+    "SELECT coalesce(substring(obj_description('athena_vocabs'::regnamespace) from 'athena_staged_checksum=([0-9a-f]+)'), '');" \
+    2>/dev/null | tr -d '[:space:]' || true
+}
+
+verify_manifest() {
+  # Strict staged-manifest proof via the shared helper (single source of
+  # truth with db/athena/load.sh and bin/setup).
+  [ -f "$REPO_ROOT/db/athena/verify_manifest.sh" ] \
+    || invalidate "missing db/athena/verify_manifest.sh"
+  sh "$REPO_ROOT/db/athena/verify_manifest.sh" "$STAGED_DIR"
+}
+
+"$REPO_ROOT/bin/check-prerequisites" >/dev/null || invalidate "preflight failed"
+"$REPO_ROOT/bin/compose" up --exit-code-from db_init db_init >/dev/null || invalidate "db_init rerun failed"
+"$REPO_ROOT/bin/compose" exec -T postgres pg_isready -U "${POSTGRES_USER:-postgres}" -d "$DB_NAME" >/dev/null 2>&1 \
+  || invalidate "postgres container not healthy"
+
+if ! VOCAB_OUT="$("$REPO_ROOT/bin/validate-vocab" 2>&1)"; then
+  printf '%s\n' "$VOCAB_OUT" >&2
+  invalidate "validate-vocab failed"
+fi
+[ -f "$STAGED_MANIFEST" ] || invalidate "no staged Athena manifest; run bin/stage-athena then bin/setup"
+verify_manifest || invalidate "staged manifest content verification failed"
+[ -f "$READY_ENV" ] || invalidate "no readiness marker; run bin/setup first"
+
+STAGED_SUM="$(awk '{print $1}' "$STAGED_MANIFEST" | LC_ALL=C sort | sha256sum | awk '{print $1}')"
+LIVE_SUM="$(live_schema_checksum)"
+[ -n "$LIVE_SUM" ] || invalidate "no live vocabulary load committed; run bin/setup first"
+READY_SUM="$(sed -n 's/^ATHENA_MANIFEST_SHA256=//p' "$READY_ENV" | head -n 1 | tr -d '[:space:]')"
+grep -qx 'SETUP_STATUS=READY' "$READY_ENV" || invalidate "readiness marker does not report READY"
+[ "$STAGED_SUM" = "$LIVE_SUM" ] || invalidate "live schema does not match staged Athena"
+[ "$STAGED_SUM" = "$READY_SUM" ] || invalidate "readiness marker checksum disagrees with staged Athena"
+if [ -f "$LOADED_FILE" ]; then
+  LOADED_SUM="$(tr -d '[:space:]' <"$LOADED_FILE")"
+  [ "$STAGED_SUM" = "$LOADED_SUM" ] || invalidate "host loaded record disagrees with staged Athena"
+fi
+
+printf '%s\n' "$VOCAB_OUT"
+PG_VERSION="$(dbq 'SHOW server_version;' | tr -d '[:space:]')" || invalidate "cannot determine PostgreSQL version"
+printf 'POSTGRES_VERSION=%s\nDATABASE_NAME=%s\nATHENA_MANIFEST_SHA256=%s\nVALIDATION=PASSED\n' \
+  "$PG_VERSION" "$DB_NAME" "$STAGED_SUM"

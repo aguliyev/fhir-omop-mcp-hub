@@ -1,0 +1,76 @@
+name: ${COMPOSE_PROJECT_NAME:-fhir_omop_mcp_hub}
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-docker.io/library/postgres:16.4-alpine@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c}
+    platform: linux/amd64
+    restart: unless-stopped
+    environment:
+      PGDATA: /data/postgres
+      POSTGRES_DB: ${POSTGRES_DB:-fhir_omop_mcp_hub}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    volumes:
+      - ${DATA_ROOT:-./data}:/data
+    secrets:
+      - postgres_password
+    ports:
+      - 127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  db_init:
+    image: ${POSTGRES_IMAGE:-docker.io/library/postgres:16.4-alpine@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c}
+    platform: linux/amd64
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-postgres}
+      PGDATABASE: ${POSTGRES_DB:-fhir_omop_mcp_hub}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    volumes:
+      - ${DATA_ROOT:-./data}:/data
+      - ./db/bootstrap:/bootstrap:ro
+    secrets:
+      - postgres_password
+    command: ["/bootstrap/run.sh"]
+    restart: "no"
+
+  athena_vocabs:
+    image: ${POSTGRES_IMAGE:-docker.io/library/postgres:16.4-alpine@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c}
+    platform: linux/amd64
+    profiles: ["athena"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-postgres}
+      PGDATABASE: ${POSTGRES_DB:-fhir_omop_mcp_hub}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-fhir_omop_mcp_hub}
+      PGPASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      ATHENA_INPUT_DIR: /data/athena_input/current
+      VOCAB_VIEW_TARGET_SCHEMAS: ${VOCAB_VIEW_TARGET_SCHEMAS:-omop_csv}
+    volumes:
+      - ${DATA_ROOT:-./data}:/data
+      - ./db/athena:/athena:ro
+    secrets:
+      - postgres_password
+    command: ["/athena/load.sh"]
+    restart: "no"
+
+# Extensible: Task 5+ adds webapi/mcp services. Keep postgres/db_init unchanged.
+
+secrets:
+  postgres_password:
+    file: ${DATA_ROOT:-./data}/secrets/postgres_password

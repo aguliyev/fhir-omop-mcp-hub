@@ -1,0 +1,126 @@
+#!/bin/sh
+# bin/reset — guarded destructive reset (Task 5).
+# Stops only this Compose project and removes only the validated canonical
+# data root. Requires typing: RESET fhir_omop_mcp_hub
+# Rejects empty paths, /, $HOME, the repository root, a symlink at any path
+# component, and targets whose sentinel is missing, non-regular, or has
+# unexpected content. The target is revalidated immediately before rm (after
+# the prompt and compose down); if it moved or changed, no rm happens.
+# Never touches the user's original Athena download (only staged copies under
+# the data root).
+set -eu
+
+REPO_ROOT="${REPO_ROOT:-$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)}"
+if [ -n "${BASH_VERSION:-}" ] && [ -f "$REPO_ROOT/bin/lib/common.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$REPO_ROOT/bin/lib/common.sh"
+fi
+# Allow-listed env-wins loader (mirrors bin/lib/common.sh, which is bash-only).
+load_setup_env() {
+  _f="$REPO_ROOT/etc/setup.env"
+  [ -f "$_f" ] || return 0
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    case "$_line" in ''|'#'*) continue ;; esac
+    _k="${_line%%=*}"
+    case "$_k" in
+      COMPOSE_PROJECT_NAME|DATA_ROOT|POSTGRES_IMAGE|POSTGRES_DB|POSTGRES_USER|POSTGRES_HOST_PORT|VOCAB_VIEW_TARGET_SCHEMAS) ;;
+      *) continue ;;
+    esac
+    eval "_set=\${${_k}+x}"
+    if [ -z "${_set:-}" ]; then
+      _val="${_line#*=}"
+      case "$_val" in
+        '"'*'"') _val="${_val#\"}"; _val="${_val%\"}" ;;
+        "'"*"'") _val="${_val#\'}"; _val="${_val%\'}"; ;;
+      esac
+      export "${_k}=${_val}"
+    fi
+  done <"$_f"
+  unset _f _line _k _set _val
+}
+if [ -n "${BASH_VERSION:-}" ] && [ -f "$REPO_ROOT/bin/lib/common.sh" ]; then
+  :
+else
+  load_setup_env
+fi
+if ! command -v die >/dev/null 2>&1; then
+  die() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+fi
+
+RAW="${DATA_ROOT:-}"
+[ -n "${RAW:-}" ] || die "DATA_ROOT is empty; refusing reset"
+REPO_CANON="$(CDPATH= cd -- "$REPO_ROOT" && pwd -P)"
+if [ -n "${HOME:-}" ] && [ -d "$HOME" ]; then
+  HOME_CANON="$(CDPATH= cd -- "$HOME" && pwd -P)"
+else
+  HOME_CANON=""
+fi
+
+lexical_abs() {
+  case "$1" in
+    /*) _a="$1";;
+    *) _a="$REPO_ROOT/$1";;
+  esac
+  _a="$(printf '%s' "$_a" | sed -e 's|//*|/|g' -e 's|/$||')"
+  [ -n "$_a" ] || _a="/"
+  printf '%s' "$_a"
+  unset _a
+}
+
+no_symlink_components() {
+  # Reject a symlink at any component of an absolute lexical path ($1).
+  _p="$1"
+  while [ "$_p" != "/" ] && [ -n "$_p" ]; do
+    [ -L "$_p" ] && return 1
+    _p="${_p%/*}"
+    [ -z "$_p" ] && _p="/"
+  done
+  return 0
+}
+
+validate_target() {
+  # Resolve RAW to canonical TARGET and enforce every guard plus the sentinel.
+  # Sets TARGET, SENTINEL, SENTINEL_CONTENT; dies on any violation.
+  _abs="$(lexical_abs "$RAW")"
+  case "$RAW" in *'..'*) die "DATA_ROOT $RAW contains '..'; refusing reset" ;; esac
+  no_symlink_components "$_abs" \
+    || die "DATA_ROOT $RAW traverses a symlink; refusing reset"
+  if [ -e "$_abs" ]; then
+    TARGET="$(CDPATH= cd -- "$_abs" && pwd -P)"
+  else
+    TARGET="$_abs"
+  fi
+  [ "$TARGET" != "/" ] || die "refusing to reset /"
+  if [ -n "$HOME_CANON" ] && [ "$TARGET" = "$HOME_CANON" ]; then
+    die "refusing to reset home directory $HOME_CANON"
+  fi
+  [ "$TARGET" != "$REPO_CANON" ] || die "refusing to reset repository root $REPO_CANON"
+  SENTINEL="$TARGET/.fhir_omop_mcp_hub_data_root"
+  [ -f "$SENTINEL" ] && [ ! -L "$SENTINEL" ] \
+    || die "sentinel $SENTINEL missing or not a regular file; refusing reset (not a setup data root)"
+  SENTINEL_CONTENT="$(cat "$SENTINEL")"
+  [ "$SENTINEL_CONTENT" = "fhir_omop_mcp_hub" ] \
+    || die "sentinel $SENTINEL has unexpected content; refusing reset"
+  unset _abs _p
+}
+
+validate_target
+EXPECTED_TARGET="$TARGET"
+EXPECTED_SENTINEL="$SENTINEL_CONTENT"
+
+printf 'About to delete setup state at: %s\n' "$TARGET"
+printf 'This removes PostgreSQL data, staged Athena copies, and generated secrets. The original Athena download is untouched.\n'
+printf 'Type RESET fhir_omop_mcp_hub to confirm: '
+IFS= read -r answer || true
+[ "${answer:-}" = "RESET fhir_omop_mcp_hub" ] || die "confirmation phrase mismatch; aborting reset"
+
+"$REPO_ROOT/bin/compose" down || die "compose down failed; data root left intact"
+# Revalidate immediately before rm: the prompt and compose down leave a window
+# in which the target could move or change. Abort without rm on any drift.
+validate_target
+[ "$TARGET" = "$EXPECTED_TARGET" ] \
+  || die "reset target changed during reset ($EXPECTED_TARGET -> $TARGET); aborting without rm"
+[ "$SENTINEL_CONTENT" = "$EXPECTED_SENTINEL" ] \
+  || die "sentinel changed during reset; aborting without rm"
+rm -rf -- "$TARGET"
+printf 'Reset complete: %s deleted. PostgreSQL state, staged copies, and secrets are gone; the original Athena download is untouched.\n' "$TARGET"

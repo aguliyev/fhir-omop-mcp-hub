@@ -1,0 +1,136 @@
+#!/bin/bash
+# Validate and stage a manual Athena export (Task 3).
+# Usage: stage-athena SOURCE_DIR [--replace]
+set -eu
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/lib" && pwd)/common.sh"
+
+T="$(printf '\t')"
+replace=0
+src=""
+for a in "$@"; do
+  case "$a" in
+    --replace) replace=1 ;;
+    -h|--help) printf 'Usage: %s SOURCE_DIR [--replace]\n' "$(basename "$0")"; exit 0 ;;
+    *) if [ -z "$src" ]; then src="$a"; else die "unexpected argument '$a'"; fi ;;
+  esac
+done
+[ -n "$src" ] || die "usage: $(basename "$0") SOURCE_DIR [--replace]"
+case "$src" in /*) ;; *) die "SOURCE_DIR must be an absolute path, got '$src'" ;; esac
+[ -L "$src" ] && die "SOURCE_DIR must not be a symlink: $src"
+[ -d "$src" ] || die "SOURCE_DIR is not a directory: $src"
+[ -r "$src" ] || die "SOURCE_DIR is not readable: $src"
+[ -x "$src" ] || die "SOURCE_DIR is not searchable: $src"
+
+req_list="$REPO_ROOT/etc/athena-required-files.txt"
+[ -f "$req_list" ] || die "missing $req_list"
+
+expected_header() {
+  case "$1" in
+    CONCEPT.csv) printf '%s' "concept_id${T}concept_name${T}domain_id${T}vocabulary_id${T}concept_class_id${T}standard_concept${T}concept_code${T}valid_start_date${T}valid_end_date${T}invalid_reason" ;;
+    CONCEPT_ANCESTOR.csv) printf '%s' "ancestor_concept_id${T}descendant_concept_id${T}min_levels_of_separation${T}max_levels_of_separation" ;;
+    CONCEPT_CLASS.csv) printf '%s' "concept_class_id${T}concept_class_name${T}concept_class_concept_id" ;;
+    CONCEPT_RELATIONSHIP.csv) printf '%s' "concept_id_1${T}concept_id_2${T}relationship_id${T}valid_start_date${T}valid_end_date${T}invalid_reason" ;;
+    CONCEPT_SYNONYM.csv) printf '%s' "concept_id${T}concept_synonym_name${T}language_concept_id" ;;
+    DOMAIN.csv) printf '%s' "domain_id${T}domain_name${T}domain_concept_id" ;;
+    DRUG_STRENGTH.csv) printf '%s' "drug_concept_id${T}ingredient_concept_id${T}amount_value${T}amount_unit_concept_id${T}numerator_value${T}numerator_unit_concept_id${T}denominator_value${T}denominator_unit_concept_id${T}box_size${T}valid_start_date${T}valid_end_date${T}invalid_reason" ;;
+    RELATIONSHIP.csv) printf '%s' "relationship_id${T}relationship_name${T}is_hierarchical${T}defines_ancestry${T}reverse_relationship_id${T}relationship_concept_id" ;;
+    VOCABULARY.csv) printf '%s' "vocabulary_id${T}vocabulary_name${T}vocabulary_reference${T}vocabulary_version${T}vocabulary_concept_id" ;;
+    *) die "unknown required file '$1'" ;;
+  esac
+}
+
+base_dir="$DATA_ROOT/athena_input"
+mkdir -p "$base_dir"
+staging="$base_dir/.staging-$$"
+rm -rf "$staging"
+mkdir -p "$staging"
+cleanup() { rm -rf "$staging"; }
+trap cleanup EXIT
+
+# Locate and validate each required file.
+while IFS= read -r base; do
+  [ -n "$base" ] || continue
+  matches="$(find "$src" -name "$base" -print | sort)"
+  count=0; found=""
+  if [ -n "$matches" ]; then
+    # shellcheck disable=SC2162
+    while IFS= read -r m; do count=$((count + 1)); found="$m"; done <<EOF
+$matches
+EOF
+  fi
+  [ "$count" -eq 1 ] || die "$base: expected exactly one file, found $count"
+  [ -L "$found" ] && die "$base: must not be a symlink: $found"
+  [ -f "$found" ] || die "$base: not a regular file: $found"
+  [ -s "$found" ] || die "$base: file is empty"
+  hdr="$(sed -n '1p' "$found")"
+  [ "$(expected_header "$base")" = "$hdr" ] || die "$base: wrong header (expected OMOP CDM 5.3.1 tab-delimited header)"
+  case "$hdr" in *"$T"*) ;; *) die "$base: not tab-delimited" ;; esac
+  case "$hdr" in *,*) die "$base: comma-delimited, expected tab-delimited" ;; esac
+  lines="$(wc -l <"$found" | tr -d ' ')"
+  [ "$lines" -ge 2 ] || die "$base: needs at least one data row"
+  # Second line must be non-empty after the header.
+  second="$(sed -n '2p' "$found")"
+  [ -n "$second" ] || die "$base: needs at least one data row"
+  cp "$found" "$staging/$base"
+done <"$req_list"
+
+# Optional provenance (never table data).
+for pat in VERSION version.txt README.txt README.md readme.txt; do
+  if [ -f "$src/$pat" ] && [ ! -L "$src/$pat" ]; then cp "$src/$pat" "$staging/$pat.prov" 2>/dev/null || true; fi
+done
+
+# Sorted checksum manifest: "<sha256> <bytes> <basename>".
+: >"$staging/manifest.sha256"
+while IFS= read -r base; do
+  [ -n "$base" ] || continue
+  sha="$(sha256sum "$staging/$base" | awk '{print $1}')"
+  bytes="$(wc -c <"$staging/$base" | tr -d ' ')"
+  printf '%s %s %s\n' "$sha" "$bytes" "$base" >>"$staging/manifest.sha256"
+done <"$req_list"
+sort -k3,3 -o "$staging/manifest.sha256" "$staging/manifest.sha256"
+
+# Non-secret provenance env.
+utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+{
+  printf 'STAGED_UTC=%s\n' "$utc"
+  printf 'SOURCE_PATH=%s\n' "$src"
+} >"$staging/source.env"
+
+current="$base_dir/current"
+previous="$base_dir/previous"
+
+move_current_aside() {
+  # H2: always remove previous first so mv renames instead of nesting
+  # current inside an existing previous directory.
+  if [ -d "$previous" ]; then
+    if [ -n "$(ls -A "$previous" 2>/dev/null)" ]; then
+      printf 'Replace existing previous snapshot? Type YES to confirm: ' >&2
+      IFS= read -r ans || die "replacement of previous not confirmed"
+      [ "$ans" = "YES" ] || die "replacement of previous not confirmed"
+    fi
+    rm -rf "$previous"
+  fi
+  mv "$current" "$previous"
+}
+
+if [ -f "$current/manifest.sha256" ]; then
+  if cmp -s "$staging/manifest.sha256" "$current/manifest.sha256"; then
+    trap - EXIT; rm -rf "$staging"
+    printf 'STAGED: %s (already current)\n' "$current"
+    exit 0
+  fi
+  [ "$replace" -eq 1 ] || die "staged Athena differs from current -- rerun with --replace after user approval"
+  move_current_aside
+elif [ -e "$current" ] || [ -L "$current" ]; then
+  # H1: a current/ without a valid manifest (e.g. an empty directory left by
+  # an older prepare-data) is not prior staged state.
+  if [ -d "$current" ] && [ -z "$(ls -A "$current" 2>/dev/null)" ]; then
+    rm -rf "$current"
+  else
+    [ "$replace" -eq 1 ] || die "current has no valid staged manifest -- rerun with --replace after user approval to replace it"
+    move_current_aside
+  fi
+fi
+mv "$staging" "$current"
+trap - EXIT
+printf 'STAGED: %s\n' "$current"

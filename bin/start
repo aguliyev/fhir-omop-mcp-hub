@@ -1,0 +1,7 @@
+#!/bin/bash
+# Start postgres and run idempotent db_init (Task 2).
+set -eu
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"$ROOT/prepare-data"
+"$ROOT/compose" up -d postgres
+"$ROOT/compose" up --exit-code-from db_init db_init

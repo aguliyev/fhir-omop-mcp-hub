@@ -1,0 +1,221 @@
+#!/bin/sh
+# bin/setup — idempotent local setup lifecycle (Task 5).
+# Order: preflight (on defaults) -> copy env example if missing ->
+# prepare-data -> start -> db_init -> staged-manifest gate ->
+# load-vocab (unless live schema already matches) ->
+# validate temp ready.env -> promote ready.env.
+# Exit 20 + ATHENA_REQUIRED when PostgreSQL is bootstrapped but no Athena
+# export is staged; exit 21 + ATHENA_REPLACE_APPROVAL_REQUIRED when the staged
+# aggregate differs from the last loaded one (operator must approve --replace
+# via bin/load-vocab, never automatic here).
+# Integration notes (siblings owned by parallel tasks):
+#   bin/start takes no arguments; it prepares data, starts postgres, runs db_init.
+#   db_init reruns via `bin/compose up --exit-code-from db_init db_init`.
+#   Aggregate checksum = sha256 of the sorted per-file hashes in manifest.sha256
+#   (same definition as bin/load-vocab and bin/validate-vocab).
+#   "Already loaded" is decided from the live `athena_staged_checksum` schema
+#   comment committed by db/athena/load.sh, never from the host cache file
+#   alone; staged bytes are proven with the shared
+#   db/athena/verify_manifest.sh before anything is marked ready.
+#   bin/lib/common.sh is bash-only, so it is sourced only under bash; under
+#   POSIX sh the inline fallbacks below apply (same die format, own env load).
+set -eu
+
+REPO_ROOT="${REPO_ROOT:-$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)}"
+# Snapshot explicitly exported configuration before any loading or defaulting:
+# setup assigns its own defaults later, and those must never shadow the file
+# on reload nor override genuine explicit environment on restore.
+for _v in COMPOSE_PROJECT_NAME DATA_ROOT POSTGRES_IMAGE POSTGRES_DB POSTGRES_USER POSTGRES_HOST_PORT VOCAB_VIEW_TARGET_SCHEMAS; do
+  eval "_saved_${_v}=\"\${${_v}-__unset__}\""
+done
+unset _v
+# Load the ignored etc/setup.env so that exported environment wins over the
+# file (mirrors bin/lib/common.sh). common.sh itself is bash-only, so under
+# POSIX sh a built-in allow-listed fallback applies instead.
+load_setup_env() {
+  _f="$REPO_ROOT/etc/setup.env"
+  [ -f "$_f" ] || return 0
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    case "$_line" in ''|'#'*) continue ;; esac
+    _k="${_line%%=*}"
+    case "$_k" in
+      COMPOSE_PROJECT_NAME|DATA_ROOT|POSTGRES_IMAGE|POSTGRES_DB|POSTGRES_USER|POSTGRES_HOST_PORT|VOCAB_VIEW_TARGET_SCHEMAS) ;;
+      *) continue ;;
+    esac
+    eval "_set=\${${_k}+x}"
+    if [ -z "${_set:-}" ]; then
+      _val="${_line#*=}"
+      case "$_val" in
+        '"'*'"') _val="${_val#\"}"; _val="${_val%\"}" ;;
+        "'"*"'") _val="${_val#\'}"; _val="${_val%\'}"; ;;
+      esac
+      export "${_k}=${_val}"
+    fi
+  done <"$_f"
+  unset _f _line _k _set _val
+}
+reload_setup_env() {
+  # Re-read the file after prepare-data (which may have canonicalized it).
+  # Drops setup-assigned defaults first so the file fills them, while genuine
+  # explicit exports (snapshotted at startup) are left untouched and win.
+  for _k in COMPOSE_PROJECT_NAME DATA_ROOT POSTGRES_IMAGE POSTGRES_DB POSTGRES_USER POSTGRES_HOST_PORT VOCAB_VIEW_TARGET_SCHEMAS; do
+    eval "_s=\"\${_saved_${_k}-__unset__}\""
+    if [ "$_s" = "__unset__" ]; then eval "unset $_k"; fi
+  done
+  unset _k _s
+  load_setup_env
+}
+if [ -n "${BASH_VERSION:-}" ] && [ -f "$REPO_ROOT/bin/lib/common.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$REPO_ROOT/bin/lib/common.sh"
+else
+  load_setup_env
+fi
+if ! command -v die >/dev/null 2>&1; then
+  die() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+fi
+
+ATHENA_URL="https://athena.ohdsi.org/"
+VOCAB_SCHEMA="athena_vocabs"
+
+load_setup_env
+
+resolve_data_root() {
+  # Pure lexical resolution to an absolute path; creates nothing, so it is
+  # safe before preflight (preflight must run before any mutation).
+  raw="${DATA_ROOT:-$REPO_ROOT/data}"
+  case "$raw" in
+    /*) abs="$raw";;
+    *) abs="$REPO_ROOT/$raw";;
+  esac
+  printf '%s' "$abs" | sed -e 's|/\./|/|g' -e 's|//*|/|g' -e 's|/$||'
+}
+
+# Read-only psql inside the postgres container via the local socket, which
+# needs no password (same as bin/validate-vocab). Never handles secrets.
+dbq() {
+  "$REPO_ROOT/bin/compose" exec -T postgres \
+    psql -U "${POSTGRES_USER:-postgres}" -d "$DB_NAME" -v ON_ERROR_STOP=1 -tAc "$1"
+}
+
+# Live proof committed by db/athena/load.sh as a schema comment
+# ('athena_staged_checksum=<hex>'); empty means no vocabulary load is
+# committed. Queried over the local socket without secrets.
+live_schema_checksum() {
+  "$REPO_ROOT/bin/compose" exec -T postgres \
+    psql -U "${POSTGRES_USER:-postgres}" -d "$DB_NAME" -v ON_ERROR_STOP=1 -tAc \
+    "SELECT coalesce(substring(obj_description('athena_vocabs'::regnamespace) from 'athena_staged_checksum=([0-9a-f]+)'), '');" \
+    2>/dev/null | tr -d '[:space:]' || true
+}
+
+staged_aggregate() {
+  awk '{print $1}' "$STAGED_MANIFEST" | LC_ALL=C sort | sha256sum | awk '{print $1}'
+}
+
+verify_manifest() {
+  # Strict staged-manifest proof via the shared helper (single source of
+  # truth with db/athena/load.sh): exactly the nine required files, no
+  # duplicates or extras, safe basenames, matching bytes and SHA-256.
+  [ -f "$REPO_ROOT/db/athena/verify_manifest.sh" ] \
+    || die "missing db/athena/verify_manifest.sh; readiness marker not written"
+  sh "$REPO_ROOT/db/athena/verify_manifest.sh" "$STAGED_DIR"
+}
+
+DATA_ROOT="$(resolve_data_root)"
+DB_NAME="${POSTGRES_DB:-fhir_omop_mcp_hub}"
+WORKDIR="$DATA_ROOT/work/setup"
+STAGED_DIR="$DATA_ROOT/athena_input/current"
+STAGED_MANIFEST="$STAGED_DIR/manifest.sha256"
+LOADED_FILE="$WORKDIR/loaded_athena.sha256"
+READY_ENV="$WORKDIR/ready.env"
+
+"$REPO_ROOT/bin/check-prerequisites" || die "preflight failed; fix reported checks and rerun bin/setup"
+# No local env: copy example, continue. Preflight runs first on defaults; this
+# copy is the only mutation allowed before prepare-data creates the data tree.
+if [ ! -f "$REPO_ROOT/etc/setup.env" ] && [ -f "$REPO_ROOT/etc/setup.env.example" ]; then
+  cp "$REPO_ROOT/etc/setup.env.example" "$REPO_ROOT/etc/setup.env"
+fi
+load_setup_env
+# First and only creation step: bin/prepare-data owns data-tree creation and
+# DATA_ROOT canonicalization, and runs only after successful preflight.
+"$REPO_ROOT/bin/prepare-data" || die "prepare-data failed"
+# prepare-data canonicalizes DATA_ROOT into the ignored env; reload it,
+# keeping explicit environment overrides (reload drops setup's own defaults
+# first, then the env-wins load restores file values around explicits).
+reload_setup_env
+DATA_ROOT="$(resolve_data_root)"
+[ -d "$DATA_ROOT" ] || die "data root $DATA_ROOT missing after prepare-data"
+DATA_ROOT="$(CDPATH= cd -- "$DATA_ROOT" && pwd -P)"
+DB_NAME="${POSTGRES_DB:-fhir_omop_mcp_hub}"
+WORKDIR="$DATA_ROOT/work/setup"
+STAGED_DIR="$DATA_ROOT/athena_input/current"
+STAGED_MANIFEST="$STAGED_DIR/manifest.sha256"
+LOADED_FILE="$WORKDIR/loaded_athena.sha256"
+READY_ENV="$WORKDIR/ready.env"
+
+"$REPO_ROOT/bin/start" || die "failed to start postgres"
+"$REPO_ROOT/bin/compose" up --exit-code-from db_init db_init >/dev/null || die "db_init failed"
+
+if [ ! -f "$STAGED_MANIFEST" ]; then
+  printf 'ATHENA_REQUIRED stage an export with bin/stage-athena, then rerun bin/setup\n'
+  printf 'Download vocabularies (SNOMED, RxNorm, LOINC, CVX, UCUM) from %s\n' "$ATHENA_URL"
+  exit 20
+fi
+if ! verify_manifest; then
+  rm -f "$READY_ENV"
+  die "staged manifest content verification failed; readiness marker not written"
+fi
+STAGED_SUM="$(staged_aggregate)"
+mkdir -p "$WORKDIR"
+# Authority for "already loaded" is the live schema comment committed by
+# db/athena/load.sh, not the host cache: a manual `bin/load-vocab --replace`
+# updates the comment, so a stale host file can never falsely block reruns.
+LIVE_SUM="$(live_schema_checksum)"
+if [ -n "$LIVE_SUM" ] && [ "$LIVE_SUM" = "$STAGED_SUM" ]; then
+  SKIP_LOAD=1
+  printf '%s' "$STAGED_SUM" >"$LOADED_FILE"
+elif [ -n "$LIVE_SUM" ]; then
+  printf 'ATHENA_REPLACE_APPROVAL_REQUIRED staged Athena differs from live vocabulary; review versions and rerun via bin/load-vocab --replace after approval\n'
+  exit 21
+else
+  SKIP_LOAD=0
+fi
+
+if [ "$SKIP_LOAD" = "0" ]; then
+  # No --yes/--replace flags: fresh loads need no approval, and replacing live
+  # data stays a manual, interactive operator action inside bin/load-vocab.
+  "$REPO_ROOT/bin/load-vocab" || die "load-vocab failed; readiness marker not written"
+  LIVE_SUM="$(live_schema_checksum)"
+  [ "$LIVE_SUM" = "$STAGED_SUM" ] || die "live schema does not match staged Athena after load; readiness marker not written"
+  printf '%s' "$STAGED_SUM" >"$LOADED_FILE"
+fi
+
+# Every deterministic check passes before the marker becomes visible, so no
+# READY state is ever published prior to successful validation. The trailing
+# validate-setup run is a confirmation gate; on its failure the marker is
+# removed and setup exits nonzero.
+[ "$STAGED_SUM" = "$LIVE_SUM" ] || die "staged and live Athena checksums disagree; readiness marker not written"
+
+if ! VOCAB_OUT="$("$REPO_ROOT/bin/validate-vocab" 2>&1)"; then
+  printf '%s\n' "$VOCAB_OUT"
+  die "validate-vocab failed; readiness marker not written"
+fi
+PG_VERSION="$(dbq 'SHOW server_version;' | tr -d '[:space:]')" || die "cannot determine PostgreSQL version"
+VOCAB_VERSION="$(dbq "SELECT string_agg(DISTINCT vocabulary_version, ' | ' ORDER BY vocabulary_version) FROM athena_vocabs.vocabulary;" | tr -d '\r\n' | sed -e 's/^ *//' -e 's/ *$//')" || die "cannot determine vocabulary version"
+[ -n "${PG_VERSION:-}" ] || die "empty PostgreSQL version; readiness marker not written"
+[ -n "${VOCAB_VERSION:-}" ] || die "empty vocabulary version; readiness marker not written"
+
+# Publish nothing until the full gate passes: validate a temporary marker,
+# then atomically promote it, so no READY state is observable beforehand.
+# The gate runs bin/validate-setup against the temp marker via override.
+tmp="$READY_ENV.$$.tmp"
+printf 'SETUP_STATUS=READY\nPOSTGRES_VERSION=%s\nDATABASE_NAME=%s\nVOCAB_SCHEMA=%s\nATHENA_MANIFEST_SHA256=%s\nVOCAB_VERSION=%s\nVALIDATED_AT=%s\n' \
+  "$PG_VERSION" "$DB_NAME" "$VOCAB_SCHEMA" "$STAGED_SUM" "$VOCAB_VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$tmp"
+
+if ! READY_ENV_OVERRIDE="$tmp" "$REPO_ROOT/bin/validate-setup"; then
+  rm -f "$tmp" "$READY_ENV"
+  die "validate-setup gate failed; readiness marker removed"
+fi
+mv -f "$tmp" "$READY_ENV"
+printf '%s\n' "$VOCAB_OUT"
+printf 'READY postgres=%s vocab=%s manifest=%s\n' "$PG_VERSION" "$VOCAB_VERSION" "$STAGED_SUM"

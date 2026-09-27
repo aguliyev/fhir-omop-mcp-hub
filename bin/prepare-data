@@ -1,0 +1,55 @@
+#!/bin/bash
+# Create the host data tree, sentinel, and secret (Task 2). Never prints secrets.
+set -eu
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/lib" && pwd)/common.sh"
+
+require_command openssl
+require_command sha256sum
+
+# Denylist on the resolved path BEFORE creating anything (H3): DATA_ROOT is
+# already symlink/..-resolved by common.sh, so sneaky paths cannot bypass this.
+HOME_RESOLVED="$(resolve_path "${HOME:-/nonexistent-home}")"
+if [ "$DATA_ROOT" = "/" ] || [ "$DATA_ROOT" = "$HOME_RESOLVED" ] || [ "$DATA_ROOT" = "$REPO_ROOT" ]; then
+  die "DATA_ROOT $DATA_ROOT is not allowed (must not be /, the home directory, or the repository root)"
+fi
+
+mkdir -p \
+  "$DATA_ROOT" \
+  "$DATA_ROOT/postgres" \
+  "$DATA_ROOT/secrets" \
+  "$DATA_ROOT/athena_input" \
+  "$DATA_ROOT/work/setup" \
+  "$DATA_ROOT/csv_input/inbox" "$DATA_ROOT/csv_input/pending" "$DATA_ROOT/csv_input/success" "$DATA_ROOT/csv_input/rejected" \
+  "$DATA_ROOT/fhir_input/inbox" "$DATA_ROOT/fhir_input/pending" "$DATA_ROOT/fhir_input/success" "$DATA_ROOT/fhir_input/rejected"
+# NOTE (H1): athena_input/current and previous are created by bin/stage-athena,
+# never here. An empty current/ would make the first stage falsely require --replace.
+
+# Never clobber another tool's directory: a mismatched sentinel is fatal.
+# The trailing newline is non-essential per plan, so accept the exact 17 bytes
+# as well; a valid file is left byte-identical (never rewritten).
+sentinel="$DATA_ROOT/.fhir_omop_mcp_hub_data_root"
+if [ -e "$sentinel" ]; then
+  [ "$(cat "$sentinel")" = "fhir_omop_mcp_hub" ] || die "data root $DATA_ROOT has a foreign sentinel -- refusing to use another tool's directory"
+else
+  printf 'fhir_omop_mcp_hub\n' >"$sentinel"
+fi
+
+pw="$DATA_ROOT/secrets/postgres_password"
+if [ ! -s "$pw" ]; then
+  umask 077
+  openssl rand -hex 32 >"$pw.tmp"
+  chmod 0600 "$pw.tmp"
+  mv "$pw.tmp" "$pw"
+fi
+chmod 0600 "$pw"
+
+# Canonicalize the ignored local env only when DATA_ROOT came from the file or
+# defaults (M2): an environment override (e.g. tests) must not leak into etc/setup.env.
+env_file="$REPO_ROOT/etc/setup.env"
+if [ "${DATA_ROOT_FROM_ENV:-0}" != "1" ] && [ -f "$env_file" ] && grep -q '^DATA_ROOT=' "$env_file"; then
+  tmp="$(mktemp)"
+  awk -v root="$DATA_ROOT" '{ if ($0 ~ /^DATA_ROOT=/) print "DATA_ROOT=" root; else print }' "$env_file" >"$tmp"
+  mv "$tmp" "$env_file"
+fi
+
+printf 'PREPARED: %s\n' "$DATA_ROOT"

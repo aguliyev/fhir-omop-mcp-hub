@@ -360,9 +360,13 @@ directories directly to the two inboxes.
 ## 12. Left for implementation planning
 
 - Implement and run the local setup and Athena bootstrap documented in
-  `docs/superpowers/plans/2026-09-27-local-setup-and-athena-bootstrap.md`.
-  Its `bin/validate-setup` command must report `READY` before the converter
-  spike begins.
+  `docs/superpowers/plans/2026-09-27-local-setup-and-athena-bootstrap.md`,
+  driven by the `setup-fhir-omop-mcp-hub` skill. The skill owns host
+  preparation, database bootstrap, the manual Athena handoff, and canonical
+  vocabulary validation. Its `bin/validate-setup` command must report `READY`
+  before the converter spike begins. The converter spike then loads the staged
+  files into isolated scratch state so experimental failures cannot damage the
+  canonical vocabulary load.
 - Execute the pre-development FhirToCdm container feasibility spike documented
   in `docs/superpowers/plans/2026-09-27-fhir-to-cdm-container-feasibility-spike.md`.
 - After the spike, record the verified FhirToCdm commit, FHIR format, runtime
