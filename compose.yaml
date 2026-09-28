@@ -94,6 +94,22 @@ services:
     secrets: [postgres_password, etl_password]
     restart: "no"
 
+  ohdsi_webapi:
+    build: ./docker/webapi
+    platform: linux/amd64
+    depends_on:
+      postgres: {condition: service_healthy}
+      db_init: {condition: service_completed_successfully}
+    secrets: [postgres_password]
+    ports: ["127.0.0.1:${WEBAPI_HOST_PORT:-8080}:8080"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/WebAPI/source/sources || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+    restart: unless-stopped
+
 # Extensible: Task 5+ adds webapi/mcp services. Keep postgres/db_init unchanged.
 
 secrets:

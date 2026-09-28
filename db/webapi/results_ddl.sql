@@ -14,6 +14,8 @@
 --   (achilles_result_concept_count.sql is a separate /ddl/achilles endpoint product
 --   and is deliberately NOT included.)
 -- Table inventory verified against the tagged sources: 32 CREATE TABLEs, 14 indexes.
+-- Live-verified 2026-09-28 against a booted v2.15.2 instance: this file is
+-- byte-identical to that endpoint's output except the two deviations below.
 -- Body SHA-256 (after this header): d42d8590b42aa47b5ff675fce923b0545ad69623fe04a3817fa7d674b6561724
 -- Deliberate deviations from raw generator output:
 --   1. `CREATE INDEX` -> `CREATE INDEX IF NOT EXISTS` (postgresql supports it;
