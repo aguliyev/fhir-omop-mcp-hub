@@ -1,5 +1,8 @@
 #!/bin/bash
-# Project status (Task 2).
+# Project status: compose ps + container health lines (Task 2).
 set -eu
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "$ROOT/compose" ps "$@"
+if [ "$#" -eq 0 ]; then
+  "$ROOT/compose" ps --format '{{.Service}} state={{.State}} health={{.Health}}' 2>/dev/null || true
+fi

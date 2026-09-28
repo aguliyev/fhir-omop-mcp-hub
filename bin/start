@@ -1,7 +1,36 @@
 #!/bin/bash
-# Start postgres and run idempotent db_init (Task 2).
-set -eu
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-"$ROOT/prepare-data"
-"$ROOT/compose" up -d postgres
-"$ROOT/compose" up --exit-code-from db_init db_init
+# bin/start — start the managed stack in dependency order.
+# postgres → db_init (foreground; failure aborts) → ohdsi_webapi (wait for
+# pre-registration health) → webapi_register (force-recreate, verify exit
+# code + one-source mapping) → mcp_server. On registration failure MCP is
+# left stopped. Thin wrapper: all pipeline behavior lives in containers.
+set -eu; cd "$(dirname "$0")/.."
+. bin/lib/common.sh
+require_command docker
+require_command curl
+require_command python3
+
+WEBAPI_URL="http://127.0.0.1:${WEBAPI_HOST_PORT:-8080}/WebAPI"
+
+bin/prepare-data
+compose up -d postgres
+compose up --exit-code-from db_init db_init
+compose up -d --wait --wait-timeout 600 ohdsi_webapi
+compose up -d --force-recreate webapi_register
+compose wait webapi_register || die "webapi_register did not exit cleanly"
+REG_STATUS="$(compose ps -a --format json 2>/dev/null | python3 -c 'import json,sys; rows=[json.loads(l) for l in sys.stdin if l.strip()]; m=[r.get("ExitCode",1) for r in rows if r.get("Service")=="webapi_register"]; print(m[0] if m else 1)' 2>/dev/null || echo 1)"
+[ "$REG_STATUS" -eq 0 ] || die "webapi_register exit=$REG_STATUS; MCP left stopped"
+SOURCES="$(curl -sf "$WEBAPI_URL/source/sources")" || die "WebAPI sources endpoint unreachable; MCP left stopped"
+python3 - "$SOURCES" <<'EOF' || die "expected exactly one omop_csv source with four daimons; MCP left stopped"
+import json, sys
+sources = json.loads(sys.argv[1])
+assert len(sources) == 1, f"expected 1 source, found {len(sources)}"
+src = sources[0]
+assert src["sourceKey"] == "omop_csv", f"unexpected sourceKey {src['sourceKey']!r}"
+daimons = {d["daimonType"]: d["tableQualifier"] for d in src["daimons"]}
+assert daimons == {"CDM": "omop_csv", "Vocabulary": "athena_vocabs",
+                   "Results": "omop_csv_results", "Temp": "omop_csv_temp"}, f"bad daimon mapping {daimons}"
+print("OK: one omop_csv source, four daimons")
+EOF
+compose up -d mcp_server
+echo "OK: stack started"

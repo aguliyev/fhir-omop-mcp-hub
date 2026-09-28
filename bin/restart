@@ -1,0 +1,7 @@
+#!/bin/bash
+# bin/restart — stop and start the managed stack after config change.
+set -eu; cd "$(dirname "$0")/.."
+. bin/lib/common.sh
+[ "$#" -eq 0 ] || die "usage: bin/restart (no service arguments)"
+bin/stop
+bin/start

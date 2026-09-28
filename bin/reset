@@ -23,7 +23,7 @@ load_setup_env() {
     case "$_line" in ''|'#'*) continue ;; esac
     _k="${_line%%=*}"
     case "$_k" in
-      COMPOSE_PROJECT_NAME|DATA_ROOT|POSTGRES_IMAGE|POSTGRES_DB|POSTGRES_USER|POSTGRES_HOST_PORT|VOCAB_VIEW_TARGET_SCHEMAS) ;;
+      COMPOSE_PROJECT_NAME|DATA_ROOT|POSTGRES_IMAGE|POSTGRES_DB|POSTGRES_USER|POSTGRES_HOST_PORT|VOCAB_VIEW_TARGET_SCHEMAS|POPULATION_SIZE|SEED|WEBAPI_HOST_PORT|MCP_HOST_PORT) ;;
       *) continue ;;
     esac
     eval "_set=\${${_k}+x}"
