@@ -14,10 +14,15 @@
 --   (achilles_result_concept_count.sql is a separate /ddl/achilles endpoint product
 --   and is deliberately NOT included.)
 -- Table inventory verified against the tagged sources: 32 CREATE TABLEs, 14 indexes.
--- Body SHA-256 (after this header): 45dc3c3db99a02de227b7c6774e34b969088e8a0b338facc745c7e42f95f213f
--- Deliberate deviation from raw generator output: `CREATE INDEX` ->
--- `CREATE INDEX IF NOT EXISTS` (postgresql supports it; raw output is not
--- rerunnable). Everything else is verbatim translated generator output.
+-- Body SHA-256 (after this header): d42d8590b42aa47b5ff675fce923b0545ad69623fe04a3817fa7d674b6561724
+-- Deliberate deviations from raw generator output:
+--   1. `CREATE INDEX` -> `CREATE INDEX IF NOT EXISTS` (postgresql supports it;
+--      raw output is not rerunnable).
+--   2. The init_concept_hierarchy.sql INSERT block is wrapped in a
+--      psql `\if :have_vocab` guard (vocabulary tables present check), because
+--      db_init runs before the Athena vocabulary is loaded; without the guard
+--      the file fails on a fresh database. Structure is always created.
+-- Everything else is verbatim translated generator output.
 -- Idempotent: safe to rerun on every `bin/setup` (db_init). TRUNCATE+INSERT init
 -- blocks (concept_hierarchy, heracles_analysis) repopulate the same rows.
 -- NOTE: at db_init time athena_vocabs is still empty (vocab loads later), so the
@@ -337,6 +342,16 @@ CREATE TABLE IF NOT EXISTS omop_csv_results.concept_hierarchy
   level4_concept_name    VARCHAR(255)
 );
 
+-- Guard: athena_vocabs tables do not exist yet at db_init time (the vocabulary
+-- loads later, and clinical refresh recreates results while vocab is present).
+-- The concept_hierarchy table itself is always created above; populate it only
+-- when the vocabulary tables exist. Recreate/populate happens on refresh-time
+-- reruns and on any db_init rerun after the vocabulary has loaded.
+SELECT CASE WHEN to_regclass('athena_vocabs.concept') IS NOT NULL
+             AND to_regclass('athena_vocabs.concept_ancestor') IS NOT NULL
+             AND to_regclass('athena_vocabs.vocabulary') IS NOT NULL
+       THEN 'true' ELSE 'false' END AS have_vocab \gset
+\if :have_vocab
 /***********************************************************/
 /***** Populate the hierarchy lookup table per treemap *****/
 /***********************************************************/
@@ -682,6 +697,7 @@ LEFT JOIN (
 	) proc_by_os3 ON proc_by_os2.os2_concept_id = proc_by_os3.os2_concept_id
 ) proc_hierarchy ON ca1.ancestor_concept_id = proc_hierarchy.os3_concept_id
 GROUP BY procs.concept_id, procs.proc_concept_name;
+\endif
 
 -- init heracles_analysis
 TRUNCATE TABLE omop_csv_results.heracles_analysis;
