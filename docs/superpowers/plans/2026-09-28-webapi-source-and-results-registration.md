@@ -75,13 +75,14 @@ Choose the newest WebAPI 2.x release that supports CDM 5.3.1 + Postgres 16; reco
 
 ```sql
 -- Idempotent omop_csv source + daimon registration.
-INSERT INTO ohdsi_webapi.webapi.source (source_id, source_name, source_key, source_connection, source_dialect)
+-- Tables live directly in the ohdsi_webapi schema (single-schema qualification).
+INSERT INTO ohdsi_webapi.source (source_id, source_name, source_key, source_connection, source_dialect)
 VALUES (100, 'Synthea CSV', 'omop_csv',
   'jdbc:postgresql://postgres:5432/fhir_omop_mcp_hub?currentSchema=omop_csv,athena_vocabs',
   'postgresql')
 ON CONFLICT (source_key) DO UPDATE SET source_name='Synthea CSV',
   source_connection='jdbc:postgresql://postgres:5432/fhir_omop_mcp_hub?currentSchema=omop_csv,athena_vocabs';
-INSERT INTO ohdsi_webapi.webapi.source_daimon (source_id, daimon_type, table_qualifier, priority)
+INSERT INTO ohdsi_webapi.source_daimon (source_id, daimon_type, table_qualifier, priority)
 VALUES (100, 0, 'omop_csv', 0), (100, 1, 'athena_vocabs', 0),
        (100, 2, 'omop_csv_results', 0), (100, 3, 'omop_csv_temp', 0)
 ON CONFLICT DO NOTHING;
@@ -102,6 +103,7 @@ git commit -m "build: define webapi source contract"
 - Create: `db/webapi/results_ddl.sql`
 - Create: `db/webapi/recreate_results.sh`
 - Modify: `db/bootstrap/run.sh` (apply `results_ddl.sql` + `register_source.sql` idempotently)
+- Modify: `compose.yaml` (`db_init:` volumes add `./db/webapi:/webapi:ro`)
 - Create: `etc/webapi.env.example`
 
 **Interfaces:**
@@ -132,27 +134,39 @@ Make executable.
 
 - [ ] **Step 3: Wire into `db_init` + env example**
 
-Append to `db/bootstrap/run.sh`:
+`db_init` needs the new SQL files. Extend its `volumes` in `compose.yaml`:
+
+```yaml
+  db_init:
+    volumes:
+      - ${DATA_ROOT:-./data}:/data
+      - ./db/bootstrap:/bootstrap:ro
+      - ./db/webapi:/webapi:ro
+```
+
+Append to `db/bootstrap/run.sh` (strict — no `|| true`; a registration failure must fail setup):
 
 ```bash
-psql -v ON_ERROR_STOP=1 -f /bootstrap/../webapi/results_ddl.sql || true  # mount-aware; see compose
-psql -v ON_ERROR_STOP=1 -f /bootstrap/../webapi/register_source.sql
+psql -v ON_ERROR_STOP=1 -f /webapi/results_ddl.sql
+psql -v ON_ERROR_STOP=1 -f /webapi/register_source.sql
 ```
 
-Prefer mounting `./db:/db:ro` in compose and referencing `/db/webapi/...`. `etc/webapi.env.example`:
+`results_ddl.sql` is idempotent (all objects `IF NOT EXISTS` or guarded), because `db_init`
+reruns on every `bin/setup`. `etc/webapi.env.example` (only variables actually consumed):
 
 ```dotenv
-WEBAPI_IMAGE_CUSTOM=local
 WEBAPI_HOST_PORT=8080
-WEBAPI_DB_SCHEMA=ohdsi_webapi
 ```
+
+(`WEBAPI_HOST_PORT` is the only WebAPI variable `compose.yaml` interpolates; DB connectivity
+comes from `POSTGRES_*` in `etc/setup.env` plus the Docker secret.)
 
 - [ ] **Step 4: Verify + commit**
 
 ```bash
 bash tests/webapi/test_webapi_contract.sh
 psql -v ON_ERROR_STOP=1 -f db/webapi/register_source.sql  # against dev db if up
-git add db/webapi db/bootstrap etc/webapi.env.example
+git add db/webapi db/bootstrap compose.yaml etc/webapi.env.example
 git commit -m "feat: add webapi results ddl and source registration"
 ```
 
@@ -162,7 +176,7 @@ git commit -m "feat: add webapi results ddl and source registration"
 - Create: `docker/webapi/Dockerfile`
 - Create: `docker/webapi/entrypoint.sh`
 - Create: `docker/webapi/settings.xml`
-- Modify: `compose.yaml` (add `ohdsi_webapi` service)
+- Modify: `compose.yaml` (append `ohdsi_webapi:` service block only)
 
 **Interfaces:**
 - Consumes: Tasks 1–2 (source rows + results schema exist via `db_init`).
@@ -171,6 +185,7 @@ git commit -m "feat: add webapi results ddl and source registration"
 - [ ] **Step 1: Write the Dockerfile + settings**
 
 ```dockerfile
+# Pin the base-image digest at implementation time.
 FROM tomcat:10.1-jre17
 # Resolve the real war URL+SHA at implementation time and pin both here,
 # e.g. curl -sL <release-war-url> | sha256sum; build fails without pinned values.
@@ -196,7 +211,6 @@ ENTRYPOINT ["/entrypoint.sh"]
     depends_on:
       postgres: {condition: service_healthy}
       db_init: {condition: service_completed_successfully}
-    env_file: [etc/setup.env, etc/webapi.env]
     volumes: [${DATA_ROOT:-./data}:/data]
     secrets: [postgres_password]
     ports: ["127.0.0.1:${WEBAPI_HOST_PORT:-8080}:8080"]

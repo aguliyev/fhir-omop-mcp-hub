@@ -212,9 +212,8 @@ Atomicity comes from same-filesystem `mv` of a complete staged dir. On any error
 
 No `env_file` (consistent with existing services; missing optional env files break Compose).
 Callers export `POPULATION_SIZE`/`SEED` in-process; see the operator plan's `common.sh`
-forwarding. Never add `env_file` entries for files that may not exist.
-
-`bin/prepare-data`: also `mkdir -p` the four states under both `csv_input/` and `fhir_input/`.
+forwarding. Never add `env_file` entries for files that may not exist. (Queue directories
+already exist via `bin/prepare-data`; nothing to create here.)
 
 - [ ] **Step 5: Run, verify, commit**
 

@@ -10,6 +10,11 @@
 
 **Spec:** `docs/intro.md` §§4, 5, 7, 8 (three tools; v1 `source_key` always `omop_csv`; ports on 127.0.0.1).
 
+**File ownership (parallel agents):** this plan owns `mcp_server/`, `etc/mcp.env.example`,
+`tests/mcp/`. It must not edit `compose.yaml` beyond appending its own `mcp_server:` block,
+and must not touch any other plan's files. WebAPI endpoint shapes come from the WebAPI plan;
+if they differ from those assumed below, adapt and record (see Stop Rules).
+
 ## Global Constraints
 
 - Accept `source_key` on every tool but reject anything except `omop_csv` with a clear error (`omop_fhir` deferred).
@@ -24,9 +29,9 @@
 ## Planned File Structure
 
 ```text
-mcp_server/{pyproject.toml,Dockerfile,server.py,translator.py,executor.py,models.py}
+mcp_server/{__init__.py,pyproject.toml,Dockerfile,server.py,translator.py,executor.py,models.py}
 etc/mcp.env.example            # WEBAPI_BASE_URL, MCP_HOST_PORT
-tests/mcp/{test_translator.py,test_executor.py,test_cohort_query.py,fixtures/concepts.json}
+tests/mcp/{__init__.py,test_translator.py,test_executor.py,test_cohort_query.py,fixtures/concepts.json}
 ```
 
 `models.py` owns the cohort-expression subset + provenance schema; `translator.py`/`executor.py` are thin WebAPI clients; `server.py` registers the three MCP tools.
@@ -37,6 +42,8 @@ tests/mcp/{test_translator.py,test_executor.py,test_cohort_query.py,fixtures/con
 
 **Files:**
 - Create: `mcp_server/models.py`
+- Create: `mcp_server/__init__.py` (empty)
+- Create: `tests/mcp/__init__.py` (empty)
 - Create: `tests/mcp/test_translator.py` (subset cases, failing first)
 - Create: `tests/mcp/fixtures/concepts.json`
 
@@ -53,7 +60,11 @@ from mcp_server.models import parse_expression
 class TestExpression(unittest.TestCase):
     def test_type2_diabetes_female(self):
         e = parse_expression("women with type 2 diabetes")
-        self.assertIn("CONCEPT_PLACEHOLDER", str(e))  # replaced after vocab lookup
+        ids = sorted(c.concept_id for c in e.criteria)
+        self.assertEqual(ids, [8532, 201826])
+    def test_unsupported_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_expression("left-handed redheads")
 if __name__ == "__main__":
     unittest.main()
 ```
@@ -126,9 +137,11 @@ Expected: PASS.
 ```python
 def test_translate_hits_live_search(self):
     from mcp_server.translator import translate
+    # Stub keys must match the lookup terms translate() derives: first word of each
+    # seed concept name, lowercased ("type" from "Type 2 diabetes mellitus", "female").
     out = translate("women with type 2 diabetes", search_fn=lambda term, domain: {
-        "diabete": [{"concept_id": 201826, "concept_name": "Type 2 diabetes mellitus", "domain": "Condition"}],
-        "women": [{"concept_id": 8532, "concept_name": "Female", "domain": "Gender"}],
+        "type": [{"concept_id": 201826, "concept_name": "Type 2 diabetes mellitus", "domain": "Condition"}],
+        "female": [{"concept_id": 8532, "concept_name": "Female", "domain": "Gender"}],
     }[term])
     ids = sorted(c["concept_id"] for c in out["cohort_definition"]["criteria"])
     self.assertEqual(ids, [8532, 201826])
@@ -248,7 +261,7 @@ git commit -m "feat: add mcp executor lifecycle"
 - Create: `mcp_server/Dockerfile`
 - Create: `etc/mcp.env.example`
 - Create: `tests/mcp/test_cohort_query.py`
-- Modify: `compose.yaml` (add `mcp_server`)
+- Modify: `compose.yaml` (append `mcp_server:` service block only)
 
 **Interfaces:**
 - Consumes: Tasks 1–3 + WebAPI base URL from the WebAPI plan.
@@ -259,10 +272,10 @@ git commit -m "feat: add mcp executor lifecycle"
 ```python
 # tests/mcp/test_cohort_query.py
 import unittest
-from mcp_server.server import cohort_query
+from mcp_server.server import run_cohort_query
 class TestChain(unittest.TestCase):
     def test_chain_summary(self):
-        out = cohort_query("women with type 2 diabetes", "omop_csv",
+        out = run_cohort_query("women with type 2 diabetes", "omop_csv",
             translate_fn=lambda q: {"cohort_definition": {"name": q, "criteria": [{"concept_id": 1}]},
                                     "provenance": {"concept_ids": [1], "webapi_calls": ["GET /vocabulary/search"]}},
             execute_fn=lambda d, s: {"cohort_id": 7, "counts": {"persons": 3}, "provenance": {}})
@@ -280,6 +293,13 @@ from mcp.server.fastmcp import FastMCP
 from .translator import translate
 from .executor import execute
 mcp = FastMCP("omop-cohort")
+def run_cohort_query(question, source_key="omop_csv", translate_fn=translate, execute_fn=execute):
+    t = translate_fn(question)
+    e = execute_fn(t["cohort_definition"], source_key)
+    n = e["counts"].get("persons", 0)
+    return {"summary": f"{n} persons match '{question}' on {source_key}.",
+            "cohort_definition": t["cohort_definition"], "counts": e["counts"],
+            "provenance": {**t.get("provenance", {}), **e.get("provenance", {})}}
 @mcp.tool()
 def translate_tool(question: str) -> dict:
     """Natural language -> inspectable cohort-definition JSON (no execution)."""
@@ -288,21 +308,35 @@ def translate_tool(question: str) -> dict:
 def execute_tool(cohort_definition: dict, source_key: str = "omop_csv") -> dict:
     """Execute cohort JSON on source_key (v1: omop_csv only)."""
     return execute(cohort_definition, source_key)
-@mcp.tool()
-def cohort_query(question: str, source_key: str = "omop_csv") -> dict:
-    return cohort_query(question, source_key)
-def cohort_query(question, source_key="omop_csv", translate_fn=translate, execute_fn=execute):
-    t = translate_fn(question)
-    e = execute_fn(t["cohort_definition"], source_key)
-    n = e["counts"].get("persons", 0)
-    return {"summary": f"{n} persons match '{question}' on {source_key}.",
-            "cohort_definition": t["cohort_definition"], "counts": e["counts"],
-            "provenance": {**t.get("provenance", {}), **e.get("provenance", {})}}
+@mcp.tool(name="cohort_query")
+def cohort_query_tool(question: str, source_key: str = "omop_csv") -> dict:
+    """High-level natural-language cohort query with provenance."""
+    return run_cohort_query(question, source_key)
 if __name__ == "__main__":
     mcp.run()
 ```
 
-`pyproject.toml`: `python>=3.12`, `mcp`, `httpx`, `pydantic`. Dockerfile: `python:3.12-slim`, `pip install .`, `CMD ["python", "-m", "mcp_server.server"]`. `etc/mcp.env.example`:
+One plain function (`run_cohort_query`, unit-testable) plus three thin tool wrappers — never two
+same-named definitions, which would shadow the registered tool.
+
+`pyproject.toml` (minimal, real content — no placeholders):
+
+```toml
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "omop-mcp-server"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["mcp", "httpx", "pydantic"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mcp_server*"]
+```
+
+Dockerfile (pin the base-image digest at implementation time): `python:3.12-slim`,
+`pip install .`, `CMD ["python", "-m", "mcp_server.server"]`. `etc/mcp.env.example`:
 
 ```dotenv
 WEBAPI_BASE_URL=http://ohdsi_webapi:8080/WebAPI
@@ -317,12 +351,14 @@ Compose:
     platform: linux/amd64
     depends_on:
       ohdsi_webapi: {condition: service_healthy}
-    env_file: [etc/setup.env, etc/mcp.env]
     environment:
       WEBAPI_BASE_URL: http://ohdsi_webapi:8080/WebAPI
     ports: ["127.0.0.1:${MCP_HOST_PORT:-8000}:8000"]
     restart: unless-stopped
 ```
+
+No `env_file` (consistent with existing services). `WEBAPI_BASE_URL` here is the fixed
+in-network address; `etc/mcp.env.example` documents the host-port knob only.
 
 - [ ] **Step 3: Run all + commit**
 
