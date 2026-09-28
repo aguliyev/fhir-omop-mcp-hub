@@ -4,7 +4,7 @@
 
 **Goal:** Finish the runnable system: thin `bin/` wrappers, full Compose topology with order+health, `etc/` config layout, and a `bin/validate` end-to-end check from inbox batch to MCP answer.
 
-**Architecture:** All operator actions are thin Docker Compose wrappers; pipeline logic stays in containers (built by the other four plans). This plan owns only: `bin/{restart,validate}`, `bin/{start,stop,status,logs}` extensions for new services, `bin/lib/common.sh` forwarding for new variables, final topology verification, `etc/README.md` secret-injection docs, and `bin/validate` which asserts inbox→`omop_csv`→WebAPI→MCP chain on a tiny population and prints READY/FAILED.
+**Architecture:** All operator actions remain thin Compose wrappers. This plan extends `bin/lib/common.sh` for one ignored `etc/setup.env`; `bin/start` runs `db_init`, starts WebAPI for its own metadata migrations, runs the WebAPI registration job, then starts the Streamable HTTP MCP server. `bin/validate` checks the real inbox→CDM→WebAPI→MCP chain and prints READY/FAILED; only `--run-refresh` may generate/load a tiny batch.
 
 **Tech Stack:** POSIX shell, Docker Compose, PostgreSQL 16.4, `psql`, `curl`, Python 3 (validate helper only).
 
@@ -16,7 +16,7 @@ status,logs,reset}` modifications, `bin/lib/common.sh` env forwarding, `etc/READ
 `bin/generate` (Synthea plan), `bin/refresh-csv` (CSV plan), and every `etc/*.env.example`
 except none: each service plan owns its own env example; this plan only checks them.
 No `etc/etl.env.example`: ETL values are fixed (`CDM_VERSION=5.3.1` per intro) or shared
-(`POPULATION_SIZE` via `etc/synthea.env`); a fifth env file adds confusion for zero knobs.
+(`POPULATION_SIZE` via `etc/setup.env`); a fifth env file adds confusion for zero knobs.
 
 ## Global Constraints
 
@@ -24,7 +24,7 @@ No `etc/etl.env.example`: ETL values are fixed (`CDM_VERSION=5.3.1` per intro) o
 - Destructive `bin/reset` already exists — do not weaken its typed-confirmation + sentinel checks; extend it only to stop new services.
 - All host ports via `${*_HOST_PORT}` bound to `127.0.0.1`; defaults: postgres `5432`, WebAPI `8080`, MCP `8000`.
 - `platform: linux/amd64` on every custom service; pinned digests from other plans reused verbatim.
-- Secrets: `<data-root>/secrets/*` mode `0600`, via `/run/secrets/*` + `*_PASSWORD_FILE`; never print, log, or commit.
+- Secrets: `<data-root>/secrets/*` mode `0600`, via `/run/secrets/*` + `*_PASSWORD_FILE`; never print, log, or commit. The CSV plan's separate ETL credential must be generated and wired through this same mechanism.
 - `bin/validate` is read-only except for running a disposable `generate 5` + `refresh-csv` cycle on demand with explicit `--run-refresh` flag; default mode only checks.
 - Keep FHIR out: no `refresh-fhir`/`refresh-all` in v1.
 
@@ -78,16 +78,16 @@ Expected: FAIL (restart/validate/README missing).
 
 - [ ] **Step 2: Forward new variables through `bin/lib/common.sh`**
 
-`compose.yaml` interpolates `${POPULATION_SIZE}`, `${SEED}`, `${WEBAPI_HOST_PORT}`,
+**Run this task before any new service plan's Compose block.** `compose.yaml` interpolates `${POPULATION_SIZE}`, `${SEED}`, `${WEBAPI_HOST_PORT}`,
 `${MCP_HOST_PORT}`, but `common.sh:compose()` only exports a fixed allow-list, so service
 plans' defaults would silently win. In `bin/lib/common.sh`, add the four names to all three
 places: the `_stash`/`_unstash` loop list, the `:=` defaults block (`POPULATION_SIZE=100`,
 `SEED=` empty, `WEBAPI_HOST_PORT=8080`, `MCP_HOST_PORT=8000`), and the `export`/`compose()`
-export lists. Env overrides keep winning over files (existing stash mechanism).
+export lists. Env overrides keep winning over files (existing stash mechanism). Only `etc/setup.env` is loaded; `etc/{synthea,webapi,mcp}.env.example` are reference examples, not files to copy and source.
 
 - [ ] **Step 3: Create `etc/README.md`**
 
-`etc/README.md` (short): layout table (`setup.env` local-ignored, `*.env.example` tracked defaults, secrets under `<data-root>/secrets/` via Docker secrets), "copy example → `etc/<name>.env`, never commit", and per-service env file mapping used by compose.
+`etc/README.md` (short): one ignored `etc/setup.env` for all non-secret local settings, service `*.env.example` files as **documentation only**, and secrets under `<data-root>/secrets/` via Docker secrets. Never tell operators to create separate `etc/<service>.env` files that `common.sh` does not read.
 
 - [ ] **Step 4: Commit**
 
@@ -110,15 +110,15 @@ git commit -m "build: define operator contract"
 
 ```bash
 #!/bin/bash
-# bin/restart [service...] — recreate services after config change.
+# bin/restart — stop and start the managed stack after config change.
 set -eu; cd "$(dirname "$0")/.."
 . bin/lib/common.sh
-compose up -d "$@"
-compose ps
+[ "$#" -eq 0 ] || die "usage: bin/restart (no service arguments)"
+bin/stop
+bin/start
 ```
 
-`chmod +x bin/restart`. `bin/start` must `compose up db_init` in the foreground (logs visible,
-failure aborts startup — never suppress its stderr), then `compose up -d postgres ohdsi_webapi mcp_server`.
+`chmod +x bin/restart`. `bin/restart` restarts the complete managed stack, not arbitrary service arguments; reject nonempty `"$@"` with a usage error. `bin/start` first starts Postgres and runs `db_init` in the foreground (failure aborts startup), then starts WebAPI and waits for its **pre-registration** healthcheck, recreates `webapi_register` with `compose up -d --force-recreate webapi_register`, and starts MCP with `compose up -d mcp_server`. Compose must wait for `webapi_register` to complete successfully before starting MCP; explicitly verify its exit code and one-source mapping. Do not use `compose run --rm webapi_register`, whose removed container cannot satisfy MCP's `service_completed_successfully` dependency. On failure leave MCP stopped. After a CSV refresh, `bin/refresh-csv` uses the same sequence only after data validates.
 `bin/stop` stops only this project (`compose stop`, never `down -v`). `bin/status` = `compose ps` + container health lines. `bin/reset` keeps its confirmation flow; add new service names to its stop list only.
 
 - [ ] **Step 2: Verify + commit**
@@ -145,7 +145,7 @@ git commit -m "feat: complete lifecycle wrappers"
 Extend `tests/operator/test_bin_contract.sh` (already checks loopback) with:
 
 ```bash
-for s in postgres db_init athena_vocabs synthea etl_synthea ohdsi_webapi mcp_server; do
+for s in postgres db_init athena_vocabs synthea etl_synthea ohdsi_webapi webapi_register mcp_server; do
   grep -q "^  $s:" compose.yaml || { echo "FAIL: service $s"; exit 1; }
 done
 grep -q "service_healthy" compose.yaml || { echo "FAIL: no health gating"; exit 1; }
@@ -156,8 +156,7 @@ grep -q "service_completed_successfully" compose.yaml || { echo "FAIL: no db_ini
 
 Single default network (Compose-provided), no custom networks (YAGNI). Expected order:
 `postgres` (healthy) → `db_init` (completed) → `athena_vocabs` (profile `athena`, manual) /
-`etl_synthea` (manual `run`) / `synthea` (manual `run`); persistent `ohdsi_webapi` (healthy,
-after `db_init`) → `mcp_server` (after `ohdsi_webapi` healthy). One-shot jobs `restart: "no"`;
+`etl_synthea` (manual `run`) / `synthea` (manual `run`); persistent `ohdsi_webapi` (healthy after migration) → one-shot `webapi_register` (completed) → `mcp_server`. One-shot jobs `restart: "no"`;
 persistent `restart: unless-stopped`. Ports only `127.0.0.1:${X_HOST_PORT}:<container>`.
 `postgres_password` secret on every DB-backed service. If any assertion fails, file the
 correction against the owning service plan — do not edit its block here.
@@ -181,29 +180,31 @@ Expected: config validates; contract passes except `bin/validate` still missing.
 - Consumes: everything above + live `omop_csv`, WebAPI, MCP.
 - Produces: `READY`/`FAILED` verdict; last gate before demo.
 
-- [ ] **Step 1: Write `bin/validate`**
+- [ ] **Step 1: Gate `READY` on real checks, not container status**
 
-```bash
-#!/bin/bash
-# bin/validate [--run-refresh] — default read-only; flag permits generate(5)+refresh cycle.
-set -eu; cd "$(dirname "$0")/.."
-. bin/lib/common.sh
-FAIL=0
-check() { if eval "$2"; then echo "PASS: $1"; else echo "FAIL: $1"; FAIL=1; fi; }
-check "postgres healthy" "compose ps postgres | grep -q healthy"
-check "omop_csv has persons table" "compose exec -T postgres psql -U postgres -d fhir_omop_mcp_hub -c '\\d omop_csv.person' >/dev/null"
-check "omop_csv vocab views" "compose exec -T postgres psql -U postgres -d fhir_omop_mcp_hub -tc \"select count(*) from omop_csv.concept\" | grep -qv '^ 0'"
-check "webapi source" "curl -sf http://127.0.0.1:${WEBAPI_HOST_PORT:-8080}/WebAPI/source/sources | grep -q omop_csv"
-check "vocab search" "curl -sf 'http://127.0.0.1:${WEBAPI_HOST_PORT:-8080}/WebAPI/vocabulary/search?query=diabetes' | grep -q CONCEPT_ID"
-check "mcp up" "curl -sf http://127.0.0.1:${MCP_HOST_PORT:-8000}/health 2>/dev/null || compose ps mcp_server | grep -q Up"
-if [ "${1:-}" = "--run-refresh" ]; then
-  bin/generate 5 && bin/refresh-csv || FAIL=1
-  check "refresh populated persons" "compose exec -T postgres psql -U postgres -d fhir_omop_mcp_hub -tc 'select count(*) from omop_csv.person' | grep -qv '^ 0'"
-fi
-[ "$FAIL" -eq 0 ] && echo "READY" || { echo "FAILED"; exit 1; }
-```
+Write the `bin/validate [--run-refresh]` wrapper only **after** the WebAPI
+source/vocabulary and MCP `/mcp` contracts have passed live tests. Reuse
+`bin/lib/common.sh` and the password-file connection pattern in
+`bin/validate-setup`; reject unknown flags. Each of these must return a
+nonzero exit and print a named failure on a broken system:
 
-`chmod +x bin/validate`. Adapt the MCP health probe to the MCP plan's actual endpoint (if no HTTP health endpoint, check `compose ps` + a `translate_tool` smoke call); record the final probe here.
+1. Query `omop_csv.person` and its vocabulary views; require a positive person
+   count without assuming the local `postgres` peer-auth user.
+2. Check WebAPI has exactly one `omop_csv` source and its four correct daemon
+   schema mappings; perform the pinned release's real vocabulary-search call.
+3. Initialize an MCP client at `http://127.0.0.1:${MCP_HOST_PORT}/mcp`, call
+   tools/list and the read-only translator, and inspect its valid Circe output.
+4. With `--run-refresh` only: `bin/generate 5`, `bin/refresh-csv`, rerun the
+   checks above, call a supported `cohort_query` and compare its count to
+   `omop_csv_results.cohort`; assert old cohort membership is removed while
+   definitions persist. Force a failed refresh in an isolated test and verify
+   `--rebuild-accepted` restores the accepted snapshot without accepting the
+   rejected batch.
+
+Default validation must not generate, execute cohorts, or mutate state. Print
+`READY` only if **every** required check ran and passed; otherwise print
+`FAILED` and return nonzero. A container being `Up`, a guessed `/health`
+endpoint, or a skipped check never counts as success.
 
 - [ ] **Step 2: Run full gate + commit**
 

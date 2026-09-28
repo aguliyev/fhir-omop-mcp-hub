@@ -4,16 +4,16 @@
 
 **Goal:** Run one OHDSI WebAPI instance that serves vocabulary search and cohort-definition/generation/execution against the single v1 `omop_csv` source.
 
-**Architecture:** `ohdsi_webapi` container (pinned WebAPI release, linux/amd64) connects to `fhir_omop_mcp_hub` with one JDBC connection per source. `db_init` idempotently creates `omop_csv_results`/`omop_csv_temp` via WebAPI-generated results DDL and registers the `omop_csv` source + daimons from repo config. Clinical refresh drops+recreates only this source's results/temp schemas. No `omop_fhir` registration in v1.
+**Architecture:** `db_init` prepares schemas and the pinned WebAPI results DDL; `ohdsi_webapi` boots and migrates its own metadata tables; then a one-shot `webapi_register` job idempotently registers and verifies `omop_csv`. `mcp_server` starts only after registration succeeds. Clinical refresh drops+recreates only this source's results/temp schemas. No `omop_fhir` registration in v1.
 
-**Tech Stack:** Docker Compose, PostgreSQL 16.4, OHDSI WebAPI 2.x (pinned war), Tomcat/Java 17, `psql`, POSIX shell.
+**Tech Stack:** Docker Compose, PostgreSQL 16.4, OHDSI WebAPI 2.x (pinned war), a servlet-compatible pinned Tomcat/Java runtime, `psql`, POSIX shell.
 
 **Spec:** `docs/intro.md` §§4, 6, 8, 10 (one WebAPI, one source `omop_csv`, own results/temp, shared `athena_vocabs`).
 
 **File ownership (parallel agents):** this plan owns `docker/webapi/`, `db/webapi/`,
 `etc/webapi.env.example`, `tests/webapi/`, plus the `db_init` service definition and
 `db/bootstrap/run.sh` extension. It must not edit `compose.yaml` beyond appending its own
-`ohdsi_webapi:` block and extending the existing `db_init:` block's volumes, and must not
+`ohdsi_webapi:`/`webapi_register:` blocks and extending the existing `db_init:` block's volumes, and must not
 touch any other plan's files. (`omop_fhir*` schemas already created empty by bootstrap stay
 empty and unregistered in v1 — do not remove them.)
 
@@ -23,7 +23,8 @@ empty and unregistered in v1 — do not remove them.)
 - One database `fhir_omop_mcp_hub`; source key exactly `omop_csv` (lowercase snake case).
 - Source wiring: CDM `omop_csv`, vocabulary `athena_vocabs`, results `omop_csv_results`, temp `omop_csv_temp`.
 - `ohdsi_webapi` schema holds WebAPI metadata + source/daimon rows; cohort definitions persist across clinical refreshes, executions do not.
-- Results DDL is the WebAPI-generated DDL for the results schema, stored versioned under `db/webapi/`.
+- Results DDL is the complete WebAPI-generated DDL for the pinned release, stored versioned under `db/webapi/`.
+- Do not invent metadata columns, daimon codes, Circe endpoints, or a servlet runtime: inspect the pinned release and prove each contract against a running instance before dependent plans use it.
 - WebAPI host port bound to `127.0.0.1` only (configurable, default `8080`); container-to-container via Compose network.
 - No secrets in tracked files; DB password via `/run/secrets/postgres_password`.
 
@@ -33,7 +34,7 @@ empty and unregistered in v1 — do not remove them.)
 
 ```text
 docker/webapi/{Dockerfile,PROVENANCE.md,entrypoint.sh,settings.xml}
-db/webapi/{results_ddl.sql,register_source.sql,recreate_results.sh}
+db/webapi/{results_ddl.sql,register_source.sql,recreate_results.sh,register.sh}
 db/bootstrap/{schemas.sql (extend),run.sh (extend)}
 etc/webapi.env.example
 tests/webapi/test_webapi_contract.sh
@@ -71,24 +72,7 @@ Expected: FAIL.
 
 - [ ] **Step 2: Pin WebAPI + write registration SQL**
 
-Choose the newest WebAPI 2.x release that supports CDM 5.3.1 + Postgres 16; record war URL + SHA-256 in `docker/webapi/PROVENANCE.md`. `db/webapi/register_source.sql` (idempotent, runs in `db_init`):
-
-```sql
--- Idempotent omop_csv source + daimon registration.
--- Tables live directly in the ohdsi_webapi schema (single-schema qualification).
-INSERT INTO ohdsi_webapi.source (source_id, source_name, source_key, source_connection, source_dialect)
-VALUES (100, 'Synthea CSV', 'omop_csv',
-  'jdbc:postgresql://postgres:5432/fhir_omop_mcp_hub?currentSchema=omop_csv,athena_vocabs',
-  'postgresql')
-ON CONFLICT (source_key) DO UPDATE SET source_name='Synthea CSV',
-  source_connection='jdbc:postgresql://postgres:5432/fhir_omop_mcp_hub?currentSchema=omop_csv,athena_vocabs';
-INSERT INTO ohdsi_webapi.source_daimon (source_id, daimon_type, table_qualifier, priority)
-VALUES (100, 0, 'omop_csv', 0), (100, 1, 'athena_vocabs', 0),
-       (100, 2, 'omop_csv_results', 0), (100, 3, 'omop_csv_temp', 0)
-ON CONFLICT DO NOTHING;
-```
-
-Adjust table/column names to the pinned WebAPI's actual `source`/`source_daimon` DDL — inspect the war's `WEB-INF/db/postgresql/` migration scripts and record any correction in PROVENANCE.md. Daimon types: 0 CDM, 1 vocabulary, 2 results, 3 temp.
+Choose and pin a WebAPI release whose war actually boots against Postgres 16 and the selected Java runtime; record the war URL, SHA-256, runtime image digest, and the WAR's servlet namespace (`javax` or `jakarta`) in `docker/webapi/PROVENANCE.md`. Extract its metadata migrations, identify the actual source and daimon columns, uniqueness constraints, and daimon type values, and derive `register_source.sql` from those facts. Upsert by the actual source-key constraint; repeated runs must update the same source, never allocate duplicate daemon rows. Do not execute this SQL from `db_init`: the metadata tables are not present until WebAPI finishes its first migration.
 
 - [ ] **Step 3: Commit contract**
 
@@ -102,17 +86,17 @@ git commit -m "build: define webapi source contract"
 **Files:**
 - Create: `db/webapi/results_ddl.sql`
 - Create: `db/webapi/recreate_results.sh`
-- Modify: `db/bootstrap/run.sh` (apply `results_ddl.sql` + `register_source.sql` idempotently)
+- Modify: `db/bootstrap/run.sh` (apply `results_ddl.sql` idempotently; no metadata inserts)
 - Modify: `compose.yaml` (`db_init:` volumes add `./db/webapi:/webapi:ro`)
 - Create: `etc/webapi.env.example`
 
 **Interfaces:**
-- Consumes: `register_source.sql` from Task 1.
-- Produces: `recreate_results.sh omop_csv` called by the CSV-refresh plan; `ohdsi_webapi` metadata consumed by Task 3.
+- Consumes: the results-DDL contract from the pinned release.
+- Produces: `recreate_results.sh omop_csv` called by the CSV-refresh plan; results tables consumed by Task 3.
 
 - [ ] **Step 1: Capture results DDL**
 
-Generate `results_ddl.sql` from the pinned WebAPI war (its `ddl/results/postgresql.sql` or the WebAPI "generate results DDL" endpoint against an empty schema). Qualify objects with `omop_csv_results`. Header-comment the WebAPI version + generation command. Minimal viable surface: `cohort`, `cohort_inclusion`, `cohort_inclusion_result`, `cohort_inclusion_stats`, `cohort_summary_stats`, `achilles_*` tables WebAPI requires at startup.
+Generate the **complete** results DDL for the pinned WebAPI release using its documented results-DDL generator (or versioned SQL if provided), not a hand-picked table subset. Qualify objects with `omop_csv_results`; header-comment the release, source, generation command, and checksum. Verify the schema is writable by the configured WebAPI source connection and that a test cohort can execute. Do not assume that creating the schema grants a non-owner WebAPI role access.
 
 - [ ] **Step 2: Write `recreate_results.sh`**
 
@@ -130,7 +114,7 @@ psql -v ON_ERROR_STOP=1 -c "DROP SCHEMA IF EXISTS omop_csv_temp CASCADE; CREATE 
 psql -v ON_ERROR_STOP=1 -f "$(dirname "$0")/results_ddl.sql"
 ```
 
-Make executable.
+Make executable. Require that WebAPI/MCP are stopped before either `DROP`; restore the source connection's `USAGE`/`CREATE` grants after each recreation if it does not own those schemas. Add a live test that definitions remain in `ohdsi_webapi` while prior results/cohort membership are removed.
 
 - [ ] **Step 3: Wire into `db_init` + env example**
 
@@ -148,7 +132,6 @@ Append to `db/bootstrap/run.sh` (strict — no `|| true`; a registration failure
 
 ```bash
 psql -v ON_ERROR_STOP=1 -f /webapi/results_ddl.sql
-psql -v ON_ERROR_STOP=1 -f /webapi/register_source.sql
 ```
 
 `results_ddl.sql` is idempotent (all objects `IF NOT EXISTS` or guarded), because `db_init`
@@ -165,12 +148,12 @@ comes from `POSTGRES_*` in `etc/setup.env` plus the Docker secret.)
 
 ```bash
 bash tests/webapi/test_webapi_contract.sh
-psql -v ON_ERROR_STOP=1 -f db/webapi/register_source.sql  # against dev db if up
+bin/compose run --rm db_init  # results DDL is idempotent; metadata registration waits for Task 4
 git add db/webapi db/bootstrap compose.yaml etc/webapi.env.example
 git commit -m "feat: add webapi results ddl and source registration"
 ```
 
-### Task 3: WebAPI container + compose + health check
+### Task 3: WebAPI container + metadata migration health check
 
 **Files:**
 - Create: `docker/webapi/Dockerfile`
@@ -179,14 +162,15 @@ git commit -m "feat: add webapi results ddl and source registration"
 - Modify: `compose.yaml` (append `ohdsi_webapi:` service block only)
 
 **Interfaces:**
-- Consumes: Tasks 1–2 (source rows + results schema exist via `db_init`).
-- Produces: `http://ohdsi_webapi:8080/WebAPI/` with `omop_csv` source; base URL consumed by the MCP plan.
+- Consumes: Tasks 1–2 (results schema exists via `db_init`; metadata created by WebAPI itself).
+- Produces: `http://ohdsi_webapi:8080/WebAPI/` with migrated metadata; registration is Task 4.
 
 - [ ] **Step 1: Write the Dockerfile + settings**
 
 ```dockerfile
-# Pin the base-image digest at implementation time.
-FROM tomcat:10.1-jre17
+# Pin an image compatible with the verified WAR servlet namespace; WebAPI 2.x
+# commonly uses javax.servlet, which cannot deploy on Tomcat 10 (jakarta.servlet).
+FROM tomcat:9-jre17
 # Resolve the real war URL+SHA at implementation time and pin both here,
 # e.g. curl -sL <release-war-url> | sha256sum; build fails without pinned values.
 ARG WEBAPI_WAR_URL
@@ -200,7 +184,7 @@ COPY entrypoint.sh /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 ```
 
-`settings.xml` points at `postgres:5432/fhir_omop_mcp_hub`, schema `ohdsi_webapi`, `${datasource.password}` from env; `entrypoint.sh` waits for `pg_isready`, substitutes the secret-file password, then `catalina.sh run`.
+`settings.xml` points at `postgres:5432/fhir_omop_mcp_hub`, schema `ohdsi_webapi`, `${datasource.password}` from env; `entrypoint.sh` reads the secret file without logging it, then starts Tomcat. Install or verify every executable the image uses (`unzip`, `pg_isready` if waiting for DB, and `curl` if used in the healthcheck). Test WAR deployment and metadata migration on the pinned runtime before proceeding; use a different runtime only if proved compatible and recorded in PROVENANCE.md.
 
 - [ ] **Step 2: Add compose service**
 
@@ -211,7 +195,6 @@ ENTRYPOINT ["/entrypoint.sh"]
     depends_on:
       postgres: {condition: service_healthy}
       db_init: {condition: service_completed_successfully}
-    volumes: [${DATA_ROOT:-./data}:/data]
     secrets: [postgres_password]
     ports: ["127.0.0.1:${WEBAPI_HOST_PORT:-8080}:8080"]
     healthcheck:
@@ -227,16 +210,39 @@ ENTRYPOINT ["/entrypoint.sh"]
 
 ```bash
 docker compose build ohdsi_webapi && docker compose up -d postgres ohdsi_webapi
-curl -s http://127.0.0.1:8080/WebAPI/source/sources | grep -q omop_csv
+curl -fsS http://127.0.0.1:8080/WebAPI/source/sources >/dev/null
 bash tests/webapi/test_webapi_contract.sh
 git add docker/webapi compose.yaml
 git commit -m "feat: run webapi with omop_csv source"
 ```
 
-Expected: sources endpoint lists exactly `omop_csv`; contract PASS.
+Expected: WebAPI boots and creates its metadata tables; before Task 4 its source list may be empty. Contract PASS does not by itself prove migration or source registration.
+
+### Task 4: Register and verify source after WebAPI migration
+
+**Files:**
+- Create: `db/webapi/register.sh`
+- Modify: `compose.yaml` (append `webapi_register:` one-shot service)
+- Modify: `tests/webapi/test_webapi_contract.sh` (live two-run idempotence and source mapping)
+
+**Interfaces:**
+- Consumes: healthy WebAPI from Task 3, `register_source.sql` from Task 1.
+- Produces: exactly one `omop_csv` source with four correctly qualified daimons; MCP startup depends on successful completion.
+
+- [ ] **Step 1: Prove the empty-source and repeat-registration cases**
+
+Boot WebAPI on a fresh database and assert the source list is empty before registration. Run the registration job twice; assert one source key, four expected daemon mappings, and no duplicate rows. Use the running release's source endpoint, not a string grep over SQL. Verify a vocabulary request and a results write against this source.
+
+- [ ] **Step 2: Add the post-migration registration job**
+
+`register.sh` reads `/run/secrets/postgres_password`, runs `psql -v ON_ERROR_STOP=1 -f /webapi/register_source.sql`, and asserts the source and daimon rows match the mapping in Global Constraints. Add `webapi_register` using the pinned Postgres image, `/webapi:ro`, the password secret, and `depends_on: ohdsi_webapi: {condition: service_healthy}`; set `restart: "no"`. `bin/start` (operator plan) starts/recreates this **normal Compose service**, then starts MCP with `depends_on: webapi_register: {condition: service_completed_successfully}`; do not use `compose run --rm webapi_register`, since the removed container cannot satisfy that dependency. Do not gate WebAPI's pre-registration healthcheck on an already-registered source.
+
+- [ ] **Step 3: Verify and commit**
+
+Run the two-run live registration test, restart WebAPI, and verify its source endpoint still exposes exactly `omop_csv`; commit only `db/webapi/`, `compose.yaml`, and `tests/webapi/`.
 
 ## Stop Rules
 
-- Stop if the pinned WebAPI's `source`/`source_daimon` DDL differs — read the war's migration SQL, adapt `register_source.sql`, record in PROVENANCE.md.
+- Stop if the pinned WebAPI cannot migrate its own metadata, the servlet namespace mismatches the runtime, or the live source/daimon/results contracts cannot be proved. Record the actual schema and endpoints in PROVENANCE.md before MCP implementation.
 - Stop before registering `omop_fhir` or a second source — v1 has exactly one source.
 - Stop on `0.0.0.0` port binding — loopback only.

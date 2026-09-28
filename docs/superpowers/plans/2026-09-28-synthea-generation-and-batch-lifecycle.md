@@ -4,7 +4,7 @@
 
 **Goal:** Add a reproducible `synthea` batch container that generates matching CSV+FHIR exports and publishes them as atomic batch directories to both inboxes.
 
-**Architecture:** Synthea 3.3.0 runs once per invocation in an ephemeral container with a recorded seed, writes to temp storage, then atomically renames complete `<batch_id>/` directories into `csv_input/inbox/` and `fhir_input/inbox/`. Only CSV is consumed downstream in v1; FHIR is archived parity. Batch manifest + shared-seed record is the contract other plans consume.
+**Architecture:** Synthea 3.3.0 runs once per invocation in an ephemeral container with recorded patient and clinician seeds, writes to temp storage, then publishes complete `<batch_id>/` directories to the FHIR inbox **before** the CSV inbox. CSV publication is the consumer-visible commit point; each directory rename is atomic, but a crash between two renames cannot be a cross-directory atomic transaction. Only CSV is consumed downstream in v1; FHIR is archived parity.
 
 **Tech Stack:** Docker Compose (linux/amd64), Synthea 3.3.0 jar, POSIX shell, SHA-256 manifest, JSON batch manifest.
 
@@ -18,7 +18,7 @@
 ## Global Constraints
 
 - Pin Synthea `3.3.0` (v3.3.0 release jar); record exact download URL+SHA-256 in `docker/synthea/PROVENANCE.md`.
-- Every run uses a unique recorded random seed; same seed+config reproduces the same population (Synthea `-s` flag).
+- Every run uses a unique recorded patient seed and records the clinician seed, reference date, population, and exporter settings needed to reproduce the population; reject reuse of a seed from any existing accepted/inbox batch.
 - Publish by atomic directory rename only; never publish partial batches or individual files.
 - Batch ID format: `YYYYMMDD-HHMMSS-<8-hex-lower>` (UTC time + `openssl rand -hex 4`); one batch ID covers both CSV and FHIR outputs.
 - CSV batch dir contains the full Synthea CSV export (with header rows); FHIR batch dir contains Bundle JSON files.
@@ -77,6 +77,8 @@ Expected: FAIL (files missing).
   "batch_id": "20260928-014500-ab12cd34",
   "synthea_version": "3.3.0",
   "seed": 12345,
+  "clinician_seed": 67890,
+  "reference_date": "20240101",
   "population": 100,
   "generated_at_utc": "2026-09-28T01:45:00Z",
   "csv_files": ["patients.csv"],
@@ -84,7 +86,7 @@ Expected: FAIL (files missing).
 }
 ```
 
-Batch ID regex: `^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$`. `seed` is the exact integer passed to Synthea `-s`. Both inbox batch dirs for one run share `batch_id`, `seed`, `generated_at_utc`.
+Batch ID regex: `^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$`. `seed`/`clinician_seed` are the exact integers passed to Synthea `-s`/`-cs`. Both inbox batch dirs share identical `batch.json` and each has its own `files.sha256` for its data files. The CSV refresh plan validates both the batch manifest and CSV checksums before assembly.
 
 - [ ] **Step 3: Create non-secret defaults**
 
@@ -154,45 +156,52 @@ CSEED="${CLINICIAN_SEED:-$((RANDOM * 32768 + RANDOM))}"
 REF="${SYNTHEA_REFERENCE_DATE:-20240101}"
 BATCH_ID="$(date -u +%Y%m%d-%H%M%S)-$(openssl rand -hex 4)"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+cd "$TMP"  # Synthea writes ./output/{csv,fhir}/ relative to CWD.
 java -jar /opt/synthea/synthea.jar -p "$POPULATION_SIZE" -s "$SEED" -cs "$CSEED" -r "$REF" \
   --exporter.csv.export true --exporter.fhir.export true \
   --exporter.use_uuid_filenames true \
   --exporter.hospital.fhir.export false --exporter.practitioner.fhir.export false
-# Synthea writes under ./output/{csv,fhir}/ relative to CWD; locate, don't assume.
-/opt/synthea/publish.sh "$TMP/output" "$BATCH_ID" "$SEED" "$POPULATION_SIZE"
+/opt/synthea/publish.sh "$TMP/output" "$BATCH_ID" "$SEED" "$POPULATION_SIZE" "$CSEED" "$REF"
 echo "GENERATED batch=$BATCH_ID seed=$SEED population=$POPULATION_SIZE"
 ```
 
-Run from an empty CWD (set `WORKDIR /tmp/synrun` + `rm -rf` before java, as the spike does),
-so `$TMP/output` is exactly this run's output. Pin only flags Synthea 3.3.0 supports;
+Run from the fresh `$TMP` CWD, so `$TMP/output` is exactly this run's output. Reject duplicate patient seeds already in `inbox/` or `success/`, including supplied `SEED`. Pin only flags Synthea 3.3.0 supports;
 if a flag differs, use the 3.3.0 `--help` equivalent and record it in PROVENANCE.md.
 
 - [ ] **Step 3: Write `publish.sh` (atomic rename)**
 
 ```bash
 #!/bin/bash
-# publish.sh <synthea-output-root> <batch-id> <seed> <population>
+# publish.sh <synthea-output-root> <batch-id> <seed> <population> <clinician-seed> <reference-date>
 set -eu
-SRC="$1"; BID="$2"; SEED="$3"; POP="$4"
+SRC="$1"; BID="$2"; SEED="$3"; POP="$4"; CSEED="$5"; REF="$6"
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 for q in csv_input fhir_input; do mkdir -p "/data/$q/inbox" "/data/$q/pending" "/data/$q/success" "/data/$q/rejected"; done
 C_STAGE="/data/csv_input/.staging-$BID"; F_STAGE="/data/fhir_input/.staging-$BID"
-rm -rf "$C_STAGE" "$F_STAGE"; mkdir -p "$C_STAGE" "$F_STAGE"
+F_DEST="/data/fhir_input/inbox/$BID"
+for d in "$C_STAGE" "$F_STAGE" "/data/csv_input/inbox/$BID" "/data/fhir_input/inbox/$BID"; do
+  [ ! -e "$d" ] || { echo "FAIL: batch path exists: $d" >&2; exit 1; }
+done
+mkdir -p "$C_STAGE" "$F_STAGE"
+PUBLISHED=0
+trap '[ "$PUBLISHED" -eq 1 ] || { rm -rf "$C_STAGE" "$F_STAGE"; [ ! -d "$F_DEST" ] || rm -rf "$F_DEST"; }' EXIT
 find "$SRC/csv" -name '*.csv' -exec cp {} "$C_STAGE/" \;
 find "$SRC/fhir" -name '*.json' -exec cp {} "$F_STAGE/" \;
-gen_manifest() { # $1=stagedir $2=glob
-  (cd "$1" && sha256sum $2 | sort > files.sha256)  # hash data files only; manifests excluded
-  csv_list=$(cd "$C_STAGE" && ls *.csv | python3 -c "import sys,json; print(json.dumps([l.strip() for l in sys.stdin]))")
-  fhir_list=$(cd "$F_STAGE" && ls *.json | python3 -c "import sys,json; print(json.dumps([l.strip() for l in sys.stdin]))")
-  printf '{"batch_id":"%s","synthea_version":"3.3.0","seed":%s,"population":%s,"generated_at_utc":"%s","csv_files":%s,"fhir_files":%s}\n' \
-    "$BID" "$SEED" "$POP" "$TS" "$csv_list" "$fhir_list" > "$1/batch.json"
+compgen -G "$C_STAGE/*.csv" >/dev/null && compgen -G "$F_STAGE/*.json" >/dev/null || { echo "FAIL: empty CSV or FHIR export" >&2; exit 1; }
+gen_manifest() { # $1=stagedir $2=extension
+  (cd "$1" && sha256sum -- *."$2" | LC_ALL=C sort > files.sha256)
+  csv_list=$(python3 -c 'import json,sys,pathlib; print(json.dumps(sorted(p.name for p in pathlib.Path(sys.argv[1]).glob("*.csv"))))' "$C_STAGE")
+  fhir_list=$(python3 -c 'import json,sys,pathlib; print(json.dumps(sorted(p.name for p in pathlib.Path(sys.argv[1]).glob("*.json"))))' "$F_STAGE")
+  printf '{"batch_id":"%s","synthea_version":"3.3.0","seed":%s,"clinician_seed":%s,"reference_date":"%s","population":%s,"generated_at_utc":"%s","csv_files":%s,"fhir_files":%s}\n' \
+    "$BID" "$SEED" "$CSEED" "$REF" "$POP" "$TS" "$csv_list" "$fhir_list" > "$1/batch.json"
 }
-gen_manifest "$C_STAGE" '*.csv'; gen_manifest "$F_STAGE" '*.json'
-mv "$C_STAGE" "/data/csv_input/inbox/$BID"
-mv "$F_STAGE" "/data/fhir_input/inbox/$BID"
+gen_manifest "$C_STAGE" csv; gen_manifest "$F_STAGE" json
+mv -T "$F_STAGE" "$F_DEST"
+mv -T "$C_STAGE" "/data/csv_input/inbox/$BID"
+PUBLISHED=1
 ```
 
-Atomicity comes from same-filesystem `mv` of a complete staged dir. On any error before `mv`, staged dirs remain hidden (dot-prefix) and the run fails without inbox pollution.
+Require nonempty CSV/FHIR inventories and verify both checksums and matching `batch.json` before either rename. On an ordinary failure after the FHIR rename, remove only this invocation's FHIR inbox dir; after a process/host crash it may remain orphaned and `bin/validate` must report that explicitly rather than claim perfect pair atomicity. Never remove an already accepted CSV batch.
 
 - [ ] **Step 4: Wire compose + queue dirs**
 
@@ -211,8 +220,9 @@ Atomicity comes from same-filesystem `mv` of a complete staged dir. On any error
 ```
 
 No `env_file` (consistent with existing services; missing optional env files break Compose).
-Callers export `POPULATION_SIZE`/`SEED` in-process; see the operator plan's `common.sh`
-forwarding. Never add `env_file` entries for files that may not exist. (Queue directories
+Callers export `POPULATION_SIZE`/`SEED` in-process from the single ignored `etc/setup.env`;
+`etc/synthea.env.example` documents values but is not sourced. The operator plan extends
+`common.sh` forwarding before this service is used. Never add `env_file` entries. (Queue directories
 already exist via `bin/prepare-data`; nothing to create here.)
 
 - [ ] **Step 5: Run, verify, commit**
@@ -246,10 +256,12 @@ set -eu; cd "$(dirname "$0")/.."
 . bin/lib/common.sh
 POP="${1:-${POPULATION_SIZE:-100}}"
 export POPULATION_SIZE="$POP"
-compose run --rm synthea
-CSV_N=$(ls "$DATA_ROOT/csv_input/inbox" | wc -l); FHIR_N=$(ls "$DATA_ROOT/fhir_input/inbox" | wc -l)
-[ "$CSV_N" -eq "$FHIR_N" ] || die "inbox mismatch csv=$CSV_N fhir=$FHIR_N"
-echo "OK: inbox pairs=$CSV_N"
+OUT="$(compose run --rm synthea)"
+BID="$(printf '%s\n' "$OUT" | sed -n 's/^GENERATED batch=\([^ ]*\) .*/\1/p')"
+[ -n "$BID" ] || die "generator did not report a batch ID"
+[ -d "$DATA_ROOT/csv_input/inbox/$BID" ] && [ -d "$DATA_ROOT/fhir_input/inbox/$BID" ] || die "missing matched batch $BID"
+cmp "$DATA_ROOT/csv_input/inbox/$BID/batch.json" "$DATA_ROOT/fhir_input/inbox/$BID/batch.json" || die "batch manifest mismatch $BID"
+echo "OK: batch=$BID"
 ```
 
 Make executable: `chmod +x bin/generate`.
@@ -264,7 +276,7 @@ git add bin/generate tests/synthea/test_batch_contract.sh
 git commit -m "feat: add bin/generate wrapper"
 ```
 
-Expected: PASS; no inbox overwrite (unique IDs), rerun safe.
+Expected: PASS; no inbox overwrite (unique IDs), rerun safe. Do not compare total CSV/FHIR inbox counts: a successful CSV refresh moves CSV out of inbox while FHIR remains archived there. Test that a failure on the second rename leaves no CSV batch visible and that both hashes match the published files.
 
 ## Stop Rules
 

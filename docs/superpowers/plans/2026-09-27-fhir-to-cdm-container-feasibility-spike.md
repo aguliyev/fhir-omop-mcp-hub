@@ -1,5 +1,11 @@
 # FhirToCdm Container Feasibility Spike Implementation Plan
 
+**Outcome (2026-09-28): `FAILED`.** Evidence is in
+`spikes/fhir_to_cdm/REPORT.md`. R4 rejects default Synthea CDT/ICD-10 codes;
+STU3 is unsupported by the pinned parser. Tasks 6-7 (output load and success
+repeatability) were inapplicable and intentionally skipped. The unchecked
+steps below are historical; do not resume this converter in CSV-only v1.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Determine whether unmodified upstream OHDSI FhirToCdm can run in a reproducible Linux container, consume pinned Synthea FHIR output, use PostgreSQL Athena vocabularies, emit loadable OMOP CDM 5.3 files, and preserve correct relationships across multiple generated batches.

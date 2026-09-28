@@ -1,5 +1,12 @@
 # `vocabulary_version` Nullability Bugfix Implementation Plan
 
+**Outcome (2026-09-28):** Tasks 1-2 are committed: nullable DDL, provenance,
+and fixture regression coverage exist. Task 3 is a separate, approval-gated
+real-Athena replacement; do not rerun it automatically. Its absolute download
+and temporary merge paths describe the original local environment, not portable
+instructions; obtain the operator's actual source path and explicit approval
+before staging/replacing any live vocabulary.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make the Athena vocabulary load accept real Athena exports by allowing `NULL` in `athena_vocabs.vocabulary.vocabulary_version`, with regression coverage.

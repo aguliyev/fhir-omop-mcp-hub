@@ -4,7 +4,7 @@
 
 **Goal:** Ship the primary deliverable: a Python MCP server with translator, executor, and chained cohort-query tools against WebAPI `omop_csv`.
 
-**Architecture:** One persistent `mcp_server` container (Python 3.12, MCP SDK, `httpx`) talks to `http://ohdsi_webapi:8080/WebAPI` over the Compose network. Translator resolves natural-language terms to OMOP concept IDs via WebAPI `/vocabulary/search`, returns inspectable cohort-definition JSON without executing. Executor runs the WebAPI cohort lifecycle (create → generate → poll → fetch counts) for `source_key=omop_csv`. High-level `cohort_query` chains both and returns plain-language summary + provenance (concept IDs, cohort id, source key, row counts, WebAPI URLs).
+**Architecture:** One persistent Streamable HTTP `mcp_server` container (Python 3.12, pinned MCP SDK, `httpx`) talks to the registered `omop_csv` WebAPI source. The translator supports only documented question templates, resolves concepts via WebAPI, and constructs valid Circe cohort JSON without executing it. The executor uses the pinned release's verified create/generate/status/count endpoints; the high-level tool chains both without losing provenance.
 
 **Tech Stack:** Python 3.12, MCP Python SDK, `httpx`, `pydantic`, stdlib `unittest`, Docker Compose.
 
@@ -21,7 +21,9 @@ if they differ from those assumed below, adapt and record (see Stop Rules).
 - Translator never executes a cohort; executor never does vocabulary free-text guessing — it takes cohort JSON + source key.
 - Every high-level response includes provenance: resolved concept IDs + names, generated cohort-definition JSON or its WebAPI ID, source key, counts, and the WebAPI endpoints called.
 - WebAPI base URL from env `WEBAPI_BASE_URL` (default `http://ohdsi_webapi:8080/WebAPI`); no hardcoded hosts in code.
-- MCP port configurable (default `8000`), bound to `127.0.0.1` on the host.
+- Streamable HTTP endpoint `/mcp` on container port `8000`; configurable host port bound to `127.0.0.1`. Bare `mcp.run()` uses stdio and will not listen on the published port.
+- Supported v1 templates: `type 2 diabetes` and `women with type 2 diabetes` (allow case/whitespace variations only). Reject other terms, combinations, negations and age filters instead of silently dropping constraints.
+- The WebAPI plan must first prove the pinned release's vocabulary search, Circe expression, cohort lifecycle and results contracts against a running server. Never treat the illustrative snippets below as verified WebAPI paths or payloads.
 - No PHI beyond synthetic demo data; no secrets in tracked files or logs.
 
 ---
@@ -31,10 +33,10 @@ if they differ from those assumed below, adapt and record (see Stop Rules).
 ```text
 mcp_server/{__init__.py,pyproject.toml,Dockerfile,server.py,translator.py,executor.py,models.py}
 etc/mcp.env.example            # WEBAPI_BASE_URL, MCP_HOST_PORT
-tests/mcp/{__init__.py,test_translator.py,test_executor.py,test_cohort_query.py,fixtures/concepts.json}
+tests/mcp/{__init__.py,test_translator.py,test_executor.py,test_cohort_query.py,fixtures/concepts.json,fixtures/accepted_circe.json}
 ```
 
-`models.py` owns the cohort-expression subset + provenance schema; `translator.py`/`executor.py` are thin WebAPI clients; `server.py` registers the three MCP tools.
+`models.py` owns the supported-template parser and provenance schema; `translator.py`/`executor.py` are thin WebAPI clients; `server.py` registers the three MCP tools. Capture `accepted_circe.json` from a cohort actually accepted by the pinned WebAPI before writing translation code; record the release and source of the fixture.
 
 ---
 
@@ -60,8 +62,8 @@ from mcp_server.models import parse_expression
 class TestExpression(unittest.TestCase):
     def test_type2_diabetes_female(self):
         e = parse_expression("women with type 2 diabetes")
-        ids = sorted(c.concept_id for c in e.criteria)
-        self.assertEqual(ids, [8532, 201826])
+        self.assertEqual([(c.domain, c.search_term) for c in e.criteria],
+                         [("Condition", "type 2 diabetes"), ("Gender", "female")])
     def test_unsupported_rejected(self):
         with self.assertRaises(ValueError):
             parse_expression("left-handed redheads")
@@ -69,12 +71,7 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-`fixtures/concepts.json`: two canned WebAPI search hits:
-
-```json
-[{"CONCEPT_ID": 201826, "CONCEPT_NAME": "Type 2 diabetes mellitus", "VOCABULARY_ID": "SNOMED", "DOMAIN_ID": "Condition"},
- {"CONCEPT_ID": 8532, "CONCEPT_NAME": "Female", "VOCABULARY_ID": "OMOP", "DOMAIN_ID": "Gender"}]
-```
+`fixtures/concepts.json`: two real-shaped search hits captured from the pinned WebAPI for condition and gender; never assume fixed concept IDs across Athena releases. `fixtures/accepted_circe.json`: a valid expression from that same release, with `PrimaryCriteria`, condition concept set, and gender inclusion, verified by creating and generating a cohort against `omop_csv`. Record how both fixtures were obtained; no patient rows are checked in.
 
 Run: `python3 -m unittest tests.mcp.test_translator -v`
 Expected: FAIL (module missing).
@@ -84,33 +81,30 @@ Expected: FAIL (module missing).
 Supported v1 subset (YAGNI — nothing else):
 
 ```python
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 class Criterion(BaseModel):
-    domain: str  # Condition | Drug | Procedure | Measurement | Gender | Age
-    concept_id: int
-    concept_name: str = ""
+    domain: str  # Condition | Gender only
+    search_term: str
 class CohortExpression(BaseModel):
     name: str
-    criteria: list[Criterion]  # AND semantics only in v1
+    criteria: list[Criterion]  # two-criterion template uses AND
 class Provenance(BaseModel):
     source_key: str
     concept_ids: list[int]
     webapi_calls: list[str]
     cohort_id: int | None = None
-    counts: dict[str, int] = {}
+    counts: dict[str, int] = Field(default_factory=dict)
 def parse_expression(text: str) -> CohortExpression:
-    t = text.lower()
-    crits = []
-    if "diabetes" in t:
-        crits.append(Criterion(domain="Condition", concept_id=201826, concept_name="Type 2 diabetes mellitus"))
-    if "female" in t or "women" in t:
-        crits.append(Criterion(domain="Gender", concept_id=8532, concept_name="Female"))
-    if not crits:
-        raise ValueError(f"unsupported expression: {text!r}")
-    return CohortExpression(name=text[:120], criteria=crits)
+    t = " ".join(text.lower().split())
+    crits = [Criterion(domain="Condition", search_term="type 2 diabetes")]
+    if t == "type 2 diabetes":
+        return CohortExpression(name=text, criteria=crits)
+    if t == "women with type 2 diabetes":
+        return CohortExpression(name=text, criteria=crits + [Criterion(domain="Gender", search_term="female")])
+    raise ValueError(f"unsupported expression: {text!r}")
 ```
 
-Full vocabulary-accurate resolution happens in Task 2 (live search replaces these seed IDs); the subset keywords above are the v1 contract. Reject anything outside this subset with `ValueError`, never hallucinate IDs.
+Full vocabulary-accurate resolution happens in Task 2; parse_expression never supplies concept IDs. Reject anything outside this subset with `ValueError`, never hallucinate IDs or silently omit a constraint.
 
 - [ ] **Step 3: Run + commit**
 
@@ -137,42 +131,20 @@ Expected: PASS.
 ```python
 def test_translate_hits_live_search(self):
     from mcp_server.translator import translate
-    # Stub keys must match the lookup terms translate() derives: first word of each
-    # seed concept name, lowercased ("type" from "Type 2 diabetes mellitus", "female").
+    # Both the live client and test client receive the same whole search terms.
     out = translate("women with type 2 diabetes", search_fn=lambda term, domain: {
-        "type": [{"concept_id": 201826, "concept_name": "Type 2 diabetes mellitus", "domain": "Condition"}],
-        "female": [{"concept_id": 8532, "concept_name": "Female", "domain": "Gender"}],
+        "type 2 diabetes": [{"CONCEPT_ID": 201826, "CONCEPT_NAME": "Type 2 diabetes mellitus", "DOMAIN_ID": "Condition", "STANDARD_CONCEPT": "S"}],
+        "female": [{"CONCEPT_ID": 8532, "CONCEPT_NAME": "Female", "DOMAIN_ID": "Gender", "STANDARD_CONCEPT": "S"}],
     }[term])
-    ids = sorted(c["concept_id"] for c in out["cohort_definition"]["criteria"])
-    self.assertEqual(ids, [8532, 201826])
+    self.assertEqual(out["provenance"]["concept_ids"], [201826, 8532])
+    self.assertIn("PrimaryCriteria", out["cohort_definition"]["expression"])
 ```
 
 Run: expect FAIL (no `translator.py`).
 
 - [ ] **Step 2: Implement `translator.py`**
 
-```python
-import os, httpx
-from .models import parse_expression
-WEBAPI = os.getenv("WEBAPI_BASE_URL", "http://ohdsi_webapi:8080/WebAPI")
-def search(term: str, domain: str) -> list[dict]:
-    r = httpx.get(f"{WEBAPI}/vocabulary/search", params={"query": term, "domain": domain}, timeout=30)
-    r.raise_for_status()
-    return r.json()
-def translate(question: str, search_fn=search) -> dict:
-    expr = parse_expression(question)  # subset gate
-    resolved = []
-    for c in expr.criteria:
-        hits = search_fn(c.concept_name.split()[0].lower() if search_fn is not search else c.concept_name, c.domain)
-        best = hits[0]
-        resolved.append({"domain": c.domain, "concept_id": best["concept_id"] if "concept_id" in best else best["CONCEPT_ID"],
-                         "concept_name": best.get("concept_name", best.get("CONCEPT_NAME", ""))})
-    return {"cohort_definition": {"name": expr.name, "criteria": resolved, "logic": "AND"},
-            "provenance": {"source_key": "omop_csv", "concept_ids": [c["concept_id"] for c in resolved],
-                           "webapi_calls": ["GET /vocabulary/search"]}}
-```
-
-Default `search_fn` hits live WebAPI; tests inject the stub. Never execute a cohort here.
+Use the exact search endpoint and response shape proven by the WebAPI plan. Pass each `Criterion.search_term` unchanged to both the injected test client and the live client; filter hits to the requested domain, valid standard concepts, and an exact or deliberately ranked name match. Raise a clear `ValueError` on no hit or ambiguity rather than indexing an empty list or taking an arbitrary first result. Starting from `fixtures/accepted_circe.json`, substitute the resolved condition/gender concept IDs into the correct Circe concept-set and inclusion-rule locations; return `{cohort_definition, provenance}` with both names, IDs, and every WebAPI request. Test that the resulting JSON is accepted by the pinned WebAPI (not merely by a stub). Translator must never execute the cohort.
 
 - [ ] **Step 3: Run + commit**
 
@@ -206,44 +178,21 @@ class TestExecutor(unittest.TestCase):
     def test_rejects_unknown_source(self):
         with self.assertRaises(ValueError): execute({"criteria": []}, "omop_fhir", api=FakeAPI())
     def test_counts(self):
-        out = execute({"name": "x", "criteria": [{"concept_id": 1}]}, "omop_csv", api=FakeAPI())
+        # Use the accepted Circe fixture and recorded WebAPI responses, not a
+        # synthetic criteria object that WebAPI cannot execute.
+        with open("tests/mcp/fixtures/accepted_circe.json") as f:
+            definition = json.load(f)
+        out = execute(definition, "omop_csv", api=FakeAPI())
         self.assertEqual(out["counts"]["persons"], 42)
 if __name__ == "__main__": unittest.main()
 ```
 
-Run: `python3 -m unittest tests.mcp.test_executor -v`
+Import `json` in the test; replace the fake response keys and routes with captures from the pinned WebAPI before expecting PASS. Add tests for a failed generation, missing cohort ID, timeout, and missing count: none may return zero as a successful cohort. Run: `python3 -m unittest tests.mcp.test_executor -v`
 Expected: FAIL.
 
 - [ ] **Step 2: Implement `executor.py`**
 
-```python
-import os, httpx, time
-WEBAPI = os.getenv("WEBAPI_BASE_URL", "http://ohdsi_webapi:8080/WebAPI")
-class LiveAPI:
-    def post(self, path, json=None):
-        r = httpx.post(WEBAPI + path, json=json, timeout=60); r.raise_for_status(); return r.json()
-    def get(self, path):
-        r = httpx.get(WEBAPI + path, timeout=30); r.raise_for_status(); return r.json()
-def execute(definition: dict, source_key: str, api=None) -> dict:
-    if source_key != "omop_csv":
-        raise ValueError(f"unknown source_key {source_key!r}; v1 supports only 'omop_csv'")
-    api = api or LiveAPI()
-    created = api.post("/cohortdefinition", json=definition)
-    cid = created.get("id")
-    api.post(f"/cohortdefinition/{cid}/generate", json={"source_key": source_key})
-    for _ in range(60):
-        st = api.get(f"/cohortdefinition/{cid}/info")
-        if st.get("status") in ("COMPLETE", "FAILED"):
-            break
-        time.sleep(5)
-    info = api.get(f"/cohortdefinition/{cid}/report/count")
-    counts = {"persons": info.get("count", 0)}
-    return {"cohort_id": cid, "counts": counts,
-            "provenance": {"source_key": source_key, "cohort_id": cid, "counts": counts,
-                           "webapi_calls": ["POST /cohortdefinition", "POST /generate", "GET /report/count"]}}
-```
-
-Adapt paths to the pinned WebAPI's actual cohort endpoints (verify against `http://127.0.0.1:8080/WebAPI/` docs in the WebAPI plan); record corrections here.
+First capture successful create, generate, status, and count requests/responses from the pinned running WebAPI and make the fake client return those exact shapes. Only then implement `execute(definition, source_key, api=None)` against those paths. Validate `source_key == "omop_csv"` before any request; require a real cohort ID; poll that source's execution status with a bounded timeout; fail on a failed, unknown, or timed-out generation; obtain an actual result count without `dict.get(..., 0)` masking errors. Preserve all called URLs and source/cohort identifiers in provenance. Add a live test that the accepted Circe fixture yields a completed generation with a count equal to the corresponding `omop_csv_results.cohort` rows. The `/generate` and `/report/count` URLs shown in the original draft were guesses and must not be copied.
 
 - [ ] **Step 3: Run + commit**
 
@@ -271,16 +220,20 @@ git commit -m "feat: add mcp executor lifecycle"
 
 ```python
 # tests/mcp/test_cohort_query.py
-import unittest
+import json, unittest
 from mcp_server.server import run_cohort_query
 class TestChain(unittest.TestCase):
     def test_chain_summary(self):
+        with open("tests/mcp/fixtures/accepted_circe.json") as f:
+            definition = json.load(f)
         out = run_cohort_query("women with type 2 diabetes", "omop_csv",
-            translate_fn=lambda q: {"cohort_definition": {"name": q, "criteria": [{"concept_id": 1}]},
-                                    "provenance": {"concept_ids": [1], "webapi_calls": ["GET /vocabulary/search"]}},
-            execute_fn=lambda d, s: {"cohort_id": 7, "counts": {"persons": 3}, "provenance": {}})
+            translate_fn=lambda q: {"cohort_definition": definition,
+                                    "provenance": {"concept_ids": [1], "webapi_calls": ["GET vocabulary"]}},
+            execute_fn=lambda d, s: {"cohort_id": 7, "counts": {"persons": 3},
+                                      "provenance": {"cohort_id": 7, "webapi_calls": ["POST generation"]}})
         self.assertIn("3 persons", out["summary"])
         self.assertEqual(out["provenance"]["cohort_id"], 7)
+        self.assertEqual(out["provenance"]["webapi_calls"], ["GET vocabulary", "POST generation"])
 if __name__ == "__main__": unittest.main()
 ```
 
@@ -294,15 +247,21 @@ from .translator import translate
 from .executor import execute
 mcp = FastMCP("omop-cohort")
 def run_cohort_query(question, source_key="omop_csv", translate_fn=translate, execute_fn=execute):
+    if source_key != "omop_csv":
+        raise ValueError("v1 supports only omop_csv")
     t = translate_fn(question)
     e = execute_fn(t["cohort_definition"], source_key)
-    n = e["counts"].get("persons", 0)
+    n = e["counts"]["persons"]
     return {"summary": f"{n} persons match '{question}' on {source_key}.",
             "cohort_definition": t["cohort_definition"], "counts": e["counts"],
-            "provenance": {**t.get("provenance", {}), **e.get("provenance", {})}}
+            "provenance": {**t.get("provenance", {}), **e.get("provenance", {}),
+                           "concept_ids": t["provenance"]["concept_ids"],
+                           "webapi_calls": t["provenance"]["webapi_calls"] + e["provenance"]["webapi_calls"]}}
 @mcp.tool()
-def translate_tool(question: str) -> dict:
+def translate_tool(question: str, source_key: str = "omop_csv") -> dict:
     """Natural language -> inspectable cohort-definition JSON (no execution)."""
+    if source_key != "omop_csv":
+        raise ValueError("v1 supports only omop_csv")
     return translate(question)
 @mcp.tool()
 def execute_tool(cohort_definition: dict, source_key: str = "omop_csv") -> dict:
@@ -313,13 +272,13 @@ def cohort_query_tool(question: str, source_key: str = "omop_csv") -> dict:
     """High-level natural-language cohort query with provenance."""
     return run_cohort_query(question, source_key)
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)
 ```
 
 One plain function (`run_cohort_query`, unit-testable) plus three thin tool wrappers — never two
 same-named definitions, which would shadow the registered tool.
 
-`pyproject.toml` (minimal, real content — no placeholders):
+`pyproject.toml` starter (pin the MCP dependency to a verified exact version before committing):
 
 ```toml
 [build-system]
@@ -351,14 +310,14 @@ Compose:
     platform: linux/amd64
     depends_on:
       ohdsi_webapi: {condition: service_healthy}
+      webapi_register: {condition: service_completed_successfully}
     environment:
       WEBAPI_BASE_URL: http://ohdsi_webapi:8080/WebAPI
     ports: ["127.0.0.1:${MCP_HOST_PORT:-8000}:8000"]
     restart: unless-stopped
 ```
 
-No `env_file` (consistent with existing services). `WEBAPI_BASE_URL` here is the fixed
-in-network address; `etc/mcp.env.example` documents the host-port knob only.
+Pin the MCP SDK to an exact version in the final `pyproject.toml` before committing (the unpinned line above is only a sketch); verify that version accepts the shown `FastMCP.run` arguments and change the invocation if necessary. Pin a Python image digest and test an actual `/mcp` initialize/tools/list call on port 8000. `0.0.0.0` is needed **inside** the container; the host publish stays `127.0.0.1` only. No `env_file`: host port lives in ignored `etc/setup.env`, loaded by `common.sh`; `WEBAPI_BASE_URL` is the fixed in-network address. `etc/mcp.env.example` is documentation only.
 
 - [ ] **Step 3: Run all + commit**
 
@@ -369,7 +328,7 @@ git add mcp_server etc/mcp.env.example tests/mcp compose.yaml
 git commit -m "feat: add mcp cohort-query server"
 ```
 
-Expected: all unit tests PASS; image builds; live check left to operator-UX plan.
+Expected: all unit tests PASS, image builds, and an MCP client can initialize and list exactly three tools at `/mcp`. The operator plan subsequently checks a live cohort end to end.
 
 ## Stop Rules
 

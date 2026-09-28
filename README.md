@@ -1,5 +1,5 @@
 # fhir-omop-mcp-hub
-Ingests FHIR clinical data, maps it to OMOP standard concepts via OHDSI Athena vocabularies, and persists it into an OMOP CDM. Exposes the data through MCP tools — natural-language cohort queries via OHDSI WebAPI to start, more planned. Includes synthetic Synthea data and dual CSV/FHIR ingestion paths for demo and comparison.
+Local v1 target: generate matching Synthea CSV and FHIR batches, load the CSV export into OMOP using Athena vocabularies, and query cohorts through WebAPI and a Streamable HTTP MCP server. FHIR is archived but not imported or compared in v1. PostgreSQL/Athena setup is implemented; generation, CSV ETL, WebAPI and MCP are still planned. The FhirToCdm feasibility spike failed; see `spikes/fhir_to_cdm/REPORT.md`.
 
 ## Quick start: local setup
 
@@ -12,4 +12,4 @@ bin/setup
 bin/validate-setup
 ```
 
-The first `bin/setup` bootstraps PostgreSQL and exits `20` with `ATHENA_REQUIRED` when no vocabulary is staged yet. The second step requires the actual user-provided absolute path to the extracted Athena export; after staging, the second `bin/setup` loads and validates. The FhirToCdm converter spike begins only after `bin/validate-setup` reports `READY`.
+The first `bin/setup` bootstraps PostgreSQL and exits `20` with `ATHENA_REQUIRED` when no vocabulary is staged yet. The second step requires the actual user-provided absolute path to the extracted Athena export; after staging, the second `bin/setup` loads and validates. The completed FhirToCdm spike is documented for future converter selection, not part of the CSV-only v1 startup path.

@@ -1,5 +1,13 @@
 # Local Setup and Athena Bootstrap Implementation Plan
 
+**Outcome (2026-09-28):** Local setup is implemented and real-Athena
+`bin/validate-setup` reported `READY`; this plan is historical, so its
+unchecked steps are not a request to rebuild the setup. The FhirToCdm spike
+was subsequently completed with a `FAILED` verdict, and CSV-only v1 does not
+depend on rerunning it. See `docs/intro.md` for the current v1 scope. The
+personal Codex validator path in Task 6 was local to the original author;
+use the repository's `bash tests/setup/test_setup_skill.sh` on other hosts.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Turn a clean checkout plus a user-downloaded OHDSI Athena export into a validated local Docker/PostgreSQL foundation that is ready to run the FhirToCdm feasibility spike.
@@ -506,10 +514,11 @@ List the nine expected filenames, explain that they are tab-delimited despite `.
 
 ```bash
 bash tests/setup/test_setup_skill.sh
-python /home/anar/.codex/skills/.system/skill-creator/scripts/quick_validate.py .agents/skills/setup-fhir-omop-mcp-hub
 ```
 
-Expected: both validators pass without scaffold placeholders.
+Expected: the repository-local contract passes without scaffold placeholders.
+An external skill-creator validator is optional only when installed on the
+operator's machine; no personal absolute path is a prerequisite.
 
 - [ ] **Step 5: Perform a fresh-task behavior check**
 

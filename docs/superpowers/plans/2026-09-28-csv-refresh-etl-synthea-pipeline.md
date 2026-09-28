@@ -4,16 +4,18 @@
 
 **Goal:** Build the v1 load path: claim CSV batches, assemble the cumulative snapshot, run ETL-Synthea 2.1.1 once, and replace `omop_csv` clinical data with accept/reject batch accounting.
 
-**Architecture:** A one-shot `etl_synthea` container (linux/amd64, R/Java ETL-Synthea 2.1.1) mounts `/data` and Postgres, claims `csv_input/inbox/<batch_id>/` → `pending/`, unions `success/`+`pending/` into `work/<refresh_id>/csv/` with one header per table, truncates `omop_csv` clinical tables (never the vocab views), runs the ETL once, then moves the refresh set to `success/` or `rejected/` with an error report. Results/temp schemas are dropped+recreated (DDL owned by the WebAPI plan; this plan calls its script if present, else truncates clinical only).
+**Architecture:** A one-shot `etl_synthea` container (linux/amd64, R/Java ETL-Synthea 2.1.1) locks the CSV queue, verifies batch manifests and file checksums, claims selected inbox batches, and assembles the complete `success/` + new `pending/` snapshot. It records the full selection and assembled hashes, invalidates results/temp with the WebAPI plan's required script, rebuilds clinical data once, validates, then accepts or rejects the new set. `--rebuild-accepted` explicitly restores only the last accepted snapshot after failure; WebAPI/MCP stay stopped until validation succeeds.
 
 **Tech Stack:** Docker Compose, PostgreSQL 16.4, ETL-Synthea 2.1.1 (R + Java), OMOP CDM 5.3.1 DDL, POSIX shell, `psql`, Python 3 (CSV merge only).
 
 **Spec:** `docs/intro.md` §§2, 5, 6, 8, 9, 10 (CSV branch, snapshot rebuilds, in-place maintenance refresh).
 
-**File ownership (parallel agents):** this plan owns `docker/etl_synthea/`, `db/omop_csv/`,
-`bin/refresh-csv`, `tests/csv_refresh/`. It must not edit `compose.yaml` beyond appending its
-own `etl_synthea:` block, and must not touch `db/webapi/` (owned by the WebAPI plan — mount it
-read-only, never copy or modify it) or any other plan's files.
+**File ownership:** this plan owns `docker/etl_synthea/`, `db/omop_csv/`,
+`bin/refresh-csv`, `tests/csv_refresh/`, plus the coordinated ETL-role additions
+to `db/bootstrap/`, `bin/prepare-data`, and Compose's secret definition.
+Do not edit `db/webapi/` (owned by the WebAPI plan — mount it read-only), or
+replace another plan's service block. Apply shared-file changes sequentially,
+not concurrently with WebAPI or operator plan edits.
 
 ## Global Constraints
 
@@ -21,9 +23,10 @@ read-only, never copy or modify it) or any other plan's files.
 - Converter runs once per refresh over the assembled snapshot, never once per batch.
 - Clinical refresh preserves the `omop_csv` schema; `TRUNCATE ... RESTART IDENTITY CASCADE` on physical clinical/helper tables, excluding the ten vocabulary views. Recreate a table only when its DDL changes.
 - Vocabulary views in `omop_csv` are never dropped here; ETL skips `LoadVocabFromSchema` and reads views.
-- ETL role reads `athena_vocabs` via views but cannot write it (existing `vocab_reader`-style grants).
-- Batch states are whole directories: `inbox → pending → success|rejected`; `success/` is immutable except by this job's atomic moves.
+- The R ETL runs with a dedicated login role permitted to write `omop_csv` clinical tables and read vocabulary views, but not write `athena_vocabs`; `vocab_reader` is NOLOGIN, and running the R ETL as `postgres` superuser does **not** satisfy this constraint. Admin-only table/results maintenance may use the existing Postgres secret. Task 1 must arrange role, grants, and a separate ignored ETL secret with the setup owner before a live load.
+- Batch states are whole directories: `inbox → pending → success|rejected`; `success/` is immutable and its manifest/checksums are rechecked before every load.
 - `refresh-csv` stops WebAPI/MCP before clearing tables and restarts only after load+validation succeed; a failed refresh leaves tables unexposed until the operator reruns.
+- Require the WebAPI plan's results-recreation script before any destructive clinical step; never skip it when missing. Serialize refresh and accepted-only recovery with one advisory file lock, and fail visibly on pre-existing `pending/` work (manual recovery only in v1).
 - `platform: linux/amd64`, loopback-only ports, no secrets in tracked files.
 
 ---
@@ -31,7 +34,7 @@ read-only, never copy or modify it) or any other plan's files.
 ## Planned File Structure
 
 ```text
-docker/etl_synthea/{Dockerfile,PROVENANCE.md,run.sh,assemble.py,clean.sql}
+docker/etl_synthea/{Dockerfile,PROVENANCE.md,run.sh,run_etl.R,assemble.py,clean.sql}
 db/omop_csv/{clinical_tables.sql,PROVENANCE.md}
 bin/refresh-csv
 tests/csv_refresh/{test_assemble.sh,test_refresh_flow.sh,fixtures/csv-batch-a/,fixtures/csv-batch-b/}
@@ -48,6 +51,8 @@ tests/csv_refresh/{test_assemble.sh,test_refresh_flow.sh,fixtures/csv-batch-a/,f
 - Create: `db/omop_csv/clinical_tables.sql`
 - Create: `docker/etl_synthea/clean.sql`
 - Create: `tests/csv_refresh/test_refresh_flow.sh` (skeleton, failing)
+- Modify: `db/bootstrap/schemas.sql`, `db/bootstrap/run.sh` (dedicated ETL login/grants provisioned using the separate secret)
+- Modify: `bin/prepare-data` and `compose.yaml` secrets (create separate ignored ETL password; coordinate with setup owner)
 
 **Interfaces:**
 - Consumes: `db/bootstrap/schemas.sql` (schemas exist), `db/athena/*` (ten vocab view names to exclude).
@@ -76,6 +81,8 @@ Expected: FAIL (files missing).
 
 From OHDSI CommonDataModel `v5.3.1` `OMOP CDM postgresql ddl.txt` take every `CREATE TABLE` except the ten vocab relations (`concept`, `concept_ancestor`, `concept_class`, `concept_relationship`, `concept_synonym`, `domain`, `drug_strength`, `relationship`, `source_to_concept_map`, `vocabulary`). Qualify with `omop_csv.`, add `IF NOT EXISTS`-style idempotence via a `DO` guard or `CREATE TABLE IF NOT EXISTS`. Record source URL + SHA-256 (`1c3dfa74...` per setup plan) in `db/omop_csv/PROVENANCE.md`. Core tables include at minimum: `person`, `observation_period`, `visit_occurrence`, `condition_occurrence`, `drug_exposure`, `procedure_occurrence`, `device_exposure`, `measurement`, `observation`, `death`, `note`, `specimen`, `fact_relationship`, `location`, `care_site`, `provider`, `payer_plan_period`, `cost`, `drug_era`, `dose_era`, `condition_era`, `cdm_source`, plus ETL-Synthea helper tables it requires.
 
+Provision `etl_loader` as a login role from an ignored `/run/secrets/etl_password`, grant only the required `omop_csv` schema/table write permissions and vocabulary-view reads, and add an integration assertion that writes to `athena_vocabs` are denied. Extend `bin/prepare-data` to generate that secret mode `0600` without printing it; wire it to `db_init` and `etl_synthea` through Compose. The admin role still runs clinical DDL and results resets. Do not store the ETL password in a tracked SQL file or a command-line argument.
+
 - [ ] **Step 3: Write `clean.sql`**
 
 ```sql
@@ -92,7 +99,7 @@ TRUNCATE
   RESTART IDENTITY CASCADE;
 ```
 
-Extend the list to exactly the tables in `clinical_tables.sql` (minus views). Never name a vocab relation.
+Extend the list to **every** physical table in `clinical_tables.sql`, including ETL helpers; never name a vocabulary view. Add a test comparing both complete table-name sets, not just checking that views are absent. `CREATE TABLE IF NOT EXISTS` does not apply later column changes: stop if the pinned CDM/ETL DDL changes until a deliberate migration or table recreation is documented.
 
 - [ ] **Step 4: Commit DDL**
 
@@ -131,13 +138,17 @@ Test (`tests/csv_refresh/test_assemble.sh`):
 ```bash
 #!/bin/bash
 set -eu
-rm -rf /tmp/asm-test
-mkdir -p /tmp/asm-test/success/a /tmp/asm-test/success/b /tmp/asm-test/pending
-cp tests/csv_refresh/fixtures/csv-batch-a/patients.csv /tmp/asm-test/success/a/
-cp tests/csv_refresh/fixtures/csv-batch-b/patients.csv /tmp/asm-test/success/b/
-python3 docker/etl_synthea/assemble.py /tmp/asm-test/success /tmp/asm-test/pending /tmp/asm-test/out
-[ "$(grep -c '^' /tmp/asm-test/out/patients.csv)" -eq 3 ] || { echo "FAIL: header+2 rows expected"; exit 1; }
-head -1 /tmp/asm-test/out/patients.csv | grep -q "^Id," || { echo "FAIL: single header"; exit 1; }
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$TMP/success/20260928-014500-ab12cd34" "$TMP/pending/20260928-014501-ab12cd35"
+cp tests/csv_refresh/fixtures/csv-batch-a/patients.csv "$TMP/success/20260928-014500-ab12cd34/"
+cp tests/csv_refresh/fixtures/csv-batch-b/patients.csv "$TMP/pending/20260928-014501-ab12cd35/"
+for batch in "$TMP"/success/* "$TMP"/pending/*; do
+  (cd "$batch" && sha256sum patients.csv > files.sha256)
+  printf '{"batch_id":"%s","synthea_version":"3.3.0","seed":12345,"population":1,"generated_at_utc":"2026-09-28T01:45:00Z","csv_files":["patients.csv"],"fhir_files":[]}' "${batch##*/}" > "$batch/batch.json"
+done
+python3 docker/etl_synthea/assemble.py "$TMP/success" "$TMP/pending" "$TMP/out"
+[ "$(grep -c '^' "$TMP/out/patients.csv")" -eq 3 ] || { echo "FAIL: header+2 rows expected"; exit 1; }
+grep -q '^Id,' "$TMP/out/patients.csv" || { echo "FAIL: single header"; exit 1; }
 echo "PASS: assemble"
 ```
 
@@ -148,7 +159,7 @@ Expected: FAIL (`assemble.py` missing).
 
 ```python
 #!/usr/bin/env python3
-"""Union CSV batches: one header per table, dedupe shared reference rows."""
+"""Union verified CSV batches: one header per table; dedupe shared references."""
 import csv, sys
 from pathlib import Path
 success, pending, out = map(Path, sys.argv[1:4])
@@ -179,11 +190,13 @@ for name, files in tables.items():
                     raise SystemExit(f"header mismatch in {f}")
                 for row in r:
                     key = (name, tuple(row))
-                    if key not in seen:  # dedupes shared reference entities
+                    if name not in {"organizations.csv", "providers.csv", "payers.csv"} or key not in seen:
                         seen.add(key)
                         w.writerow(row)
 print(f"ASSEMBLED {len(tables)} tables")
 ```
+
+Before any output is assembled, require every selected batch directory name to match `^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$`, validate `batch.json` ID/seed/population and file inventory, and verify `files.sha256` against the actual regular CSV files. Reject tampered `success/` data without deleting it; verify reference-table duplicate IDs agree on all fields rather than silently keeping inconsistent organizations/providers/payers. Return sorted batch IDs and SHA-256 of each assembled CSV to the refresh manifest. The example loop above is only the merge core; implement these validations before calling it. Test corrupt checksums, duplicate conflicting reference IDs, mismatched headers and accepted-plus-new union.
 
 - [ ] **Step 3: Run and commit**
 
@@ -201,11 +214,12 @@ Expected: PASS.
 - Create: `docker/etl_synthea/Dockerfile`
 - Create: `docker/etl_synthea/PROVENANCE.md`
 - Create: `docker/etl_synthea/run.sh`
+- Create: `docker/etl_synthea/run_etl.R` (verified ETL-Synthea 2.1.1 invocation)
 - Create: `bin/refresh-csv`
 - Modify: `compose.yaml` (add `etl_synthea` service)
 
 **Interfaces:**
-- Consumes: `assemble.py`, `clean.sql`, `clinical_tables.sql`, WebAPI results-recreate script if present (owned by the WebAPI plan; mounted read-only at `/webapi`, called only if executable).
+- Consumes: `assemble.py`, `clean.sql`, `clinical_tables.sql`, the required WebAPI results-recreate script, and post-registration WebAPI readiness from the WebAPI plan.
 - Produces: populated `omop_csv`, `success/`/`rejected/` accounting with `error.json` reports, `work/<refresh_id>/manifest.json`.
 
 - [ ] **Step 1: Write the Dockerfile**
@@ -213,7 +227,7 @@ Expected: PASS.
 ```dockerfile
 # Pin the base-image digest at implementation time.
 FROM rocker/r-ver:4.3.3
-RUN apt-get update && apt-get install -y --no-install-recommends openjdk-17-jre-headless postgresql-client python3 openssl \
+RUN apt-get update && apt-get install -y --no-install-recommends openjdk-17-jre-headless postgresql-client python3 openssl util-linux \
  && rm -rf /var/lib/apt/lists/*
 ARG ETLSYNTHEA_VERSION=2.1.1
 # Resolve the real SHA at implementation time and pin it here:
@@ -222,7 +236,7 @@ ARG ETLSYNTHEA_SHA256
 ADD https://github.com/OHDSI/ETL-Synthea/archive/refs/tags/v${ETLSYNTHEA_VERSION}.tar.gz /opt/etl-synthea.tar.gz
 RUN echo "${ETLSYNTHEA_SHA256}  /opt/etl-synthea.tar.gz" | sha256sum -c - \
  && mkdir -p /opt/etl-synthea && tar xzf /opt/etl-synthea.tar.gz -C /opt/etl-synthea --strip-components=1
-COPY run.sh assemble.py clean.sql /opt/etl-synthea/job/
+COPY run.sh run_etl.R assemble.py clean.sql /opt/etl-synthea/job/
 ENTRYPOINT ["/opt/etl-synthea/job/run.sh"]
 ```
 
@@ -232,44 +246,90 @@ Record the download URL plus the SHA-256 computed with the command in the Docker
 
 ```bash
 #!/bin/bash
-# run.sh [batch_id...] — empty args = all of inbox/. One invocation per refresh.
+# run.sh [batch_id...] | --rebuild-accepted. One invocation per snapshot.
 set -eu
 : "${PGHOST:=postgres}" "${PGPORT:=5432}" "${PGUSER:=${POSTGRES_USER:-postgres}}"
 : "${PGDATABASE:=${POSTGRES_DB:-fhir_omop_mcp_hub}}" "${POSTGRES_PASSWORD_FILE:=/run/secrets/postgres_password}"
 export PGHOST PGPORT PGUSER PGDATABASE
 PGPASSWORD="$(cat "$POSTGRES_PASSWORD_FILE")"; export PGPASSWORD
 INBOX=/data/csv_input/inbox; PEND=/data/csv_input/pending; OKDIR=/data/csv_input/success; BAD=/data/csv_input/rejected
+mkdir -p "$PEND" "$OKDIR" "$BAD"
+exec 9>/data/csv_input/.refresh.lock
+flock -n 9 || { echo "REFRESH_FAILED: another refresh is active" >&2; exit 1; }
+[ -z "$(ls -A "$PEND")" ] || { echo "REFRESH_FAILED: abandoned pending batches need manual review" >&2; exit 1; }
+MODE=normal
+if [ "${1:-}" = --rebuild-accepted ]; then
+  [ "$#" -eq 1 ] || exit 2
+  MODE=recovery; shift
+  [ -n "$(ls -A "$OKDIR")" ] || { echo "REFRESH_FAILED: no accepted snapshot" >&2; exit 1; }
+fi
 RID="$(date -u +%Y%m%d-%H%M%S)-$(openssl rand -hex 4)"; WORK="/data/work/$RID"
-mkdir -p "$WORK/csv" "$WORK/fhir" "$WORK/generated_cdm" "$PEND" "$OKDIR" "$BAD"
+mkdir -p "$WORK/csv" "$PEND" "$OKDIR" "$BAD"
 IDS="${*:-$(ls "$INBOX" 2>/dev/null || true)}"
-[ -n "$IDS" ] || { echo "NOOP: inbox empty"; exit 0; }
+[ "$MODE" != recovery ] || IDS=
+[ -n "$IDS" ] || [ "$MODE" = recovery ] || { echo "NOOP: inbox empty"; exit 0; }
+[ -x /webapi/recreate_results.sh ] || { echo "REFRESH_FAILED: results reset unavailable" >&2; exit 1; }
 for b in $IDS; do
-  case "$b" in ????-??????-????????) ;; *) echo "REFRESH_FAILED: invalid batch id '$b'" >&2; exit 1;; esac
+  case "$b" in ????????-??????-????????) ;; *) echo "REFRESH_FAILED: invalid batch id '$b'" >&2; exit 1;; esac
   [ -d "$INBOX/$b" ] || { echo "REFRESH_FAILED: batch '$b' not in inbox" >&2; exit 1; }
+  [ ! -e "$BAD/$b" ] && [ ! -e "$OKDIR/$b" ] || { echo "REFRESH_FAILED: duplicate batch '$b'" >&2; exit 1; }
 done
+STAGE=claim
+on_exit() {
+  status=$?
+  trap - EXIT
+  [ "$status" -eq 0 ] && return
+  for b in $IDS; do
+    if [ -d "$PEND/$b" ]; then
+      [ ! -e "$BAD/$b" ] || { echo "REFRESH_FAILED: rejected path exists for $b" >&2; continue; }
+      mv -T "$PEND/$b" "$BAD/$b"
+      printf '{"batch_id":"%s","refresh_id":"%s","stage":"%s","exit":%s,"manifest":"%s"}\n' \
+        "$b" "$RID" "$STAGE" "$status" "$WORK/manifest.json" > "$BAD/$b/error.json"
+    fi
+  done
+  exit "$status"
+}
+trap on_exit EXIT
 for b in $IDS; do mv "$INBOX/$b" "$PEND/$b"; done
+STAGE=assemble
 python3 /opt/etl-synthea/job/assemble.py "$OKDIR" "$PEND" "$WORK/csv"
-printf '{"refresh_id":"%s","batches":[%s],"at_utc":"%s"}\n' "$RID" \
-  "$(for b in $IDS; do printf '"%s",' "$b"; done | sed 's/,$//')" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$WORK/manifest.json"
+python3 - "$RID" "$WORK" "$OKDIR" "$PEND" <<'PY'
+import datetime, hashlib, json, pathlib, sys
+rid, work, accepted, pending = sys.argv[1], pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), pathlib.Path(sys.argv[4])
+old_ids = sorted(p.name for p in accepted.iterdir() if p.is_dir())
+new_ids = sorted(p.name for p in pending.iterdir() if p.is_dir())
+def sha(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+staged = pathlib.Path('/data/athena_input/current/manifest.sha256')
+manifest = {'refresh_id': rid, 'at_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    'accepted_batch_ids': old_ids, 'new_batch_ids': new_ids, 'snapshot_batch_ids': old_ids + new_ids,
+    'synthea_version': '3.3.0', 'etl_synthea_version': '2.1.1', 'cdm_version': '5.3.1',
+    'athena_manifest_sha256': sha(staged),
+    'assembled_sha256': {p.name: sha(p) for p in sorted((work / 'csv').glob('*.csv'))}}
+(work / 'manifest.json').write_text(json.dumps(manifest, sort_keys=True) + '\n')
+PY
+STAGE=clean
 psql -v ON_ERROR_STOP=1 -f /db-omop-csv/clinical_tables.sql
 psql -v ON_ERROR_STOP=1 -f /opt/etl-synthea/job/clean.sql
-if [ -x /webapi/recreate_results.sh ]; then /webapi/recreate_results.sh omop_csv; fi
+STAGE=reset_results
+/webapi/recreate_results.sh omop_csv
+STAGE=etl
 set +e
-Rscript -e "ETLSynthea::RunETLSynthea(...)"
+env -u PGUSER -u PGPASSWORD Rscript /opt/etl-synthea/job/run_etl.R "$WORK/csv"
 STATUS=$?; set -e
-if [ "$STATUS" -eq 0 ]; then for b in $IDS; do mv "$PEND/$b" "$OKDIR/$b"; done; echo "REFRESH_OK $RID"
-else for b in $IDS; do R="$BAD/$b"; rm -rf "$R"; mv "$PEND/$b" "$R"
-  printf '{"batch_id":"%s","refresh_id":"%s","exit":%s,"at_utc":"%s"}\n' "$b" "$RID" "$STATUS" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$R/error.json"
-done; echo "REFRESH_FAILED $RID" >&2; exit 1; fi
+[ "$STATUS" -eq 0 ] || exit "$STATUS"
+STAGE=validate
+# Run the live person-count and vocabulary-view assertions before accepting.
+STAGE=accept
+for b in $IDS; do mv -T "$PEND/$b" "$OKDIR/$b"; done
+echo "REFRESH_OK $RID"
 ```
 
-The `Rscript` line above is a placeholder for the exact ETL-Synthea 2.1.1 invocation: take it
-verbatim from the 2.1.1 README / `?ETLSynthea::RunETLSynthea` help (DB connection to `omop_csv`,
-vocabulary via the `omop_csv` views, `cdmVersion='5.3.1'`, `syntheaVersion='3.3.0'`, skip
-`LoadVocabFromSchema`) and record the final command in PROVENANCE.md. Failed batches keep input
-+ `error.json` under `rejected/`. `clinical_tables.sql` uses `CREATE TABLE IF NOT EXISTS`, so
-applying it on every refresh is idempotent. `/db-omop-csv` and `/webapi` are read-only mounts
-(see compose below); `recreate_results.sh` is owned by the WebAPI plan and only called if present.
+Before committing, replace the marked validation comment with real person-count and vocabulary-view assertions, and capture per-refresh sanitized logs below `work/<refresh_id>/`; include their path in `error.json`. Ensure the EXIT handler covers every post-claim failure without overwriting a rejected directory or altering accepted batches. A failed refresh keeps WebAPI/MCP stopped. A crash during multiple final directory renames can leave a partially accepted set: report it for manual reconciliation rather than claiming atomic acceptance or restarting queries; crash recovery remains out of scope. `--rebuild-accepted` has no new batches to move and never consumes inbox or rejected input. Implement `run_etl.R` from the pinned 2.1.1 entry point (CDM `5.3.1`, Synthea `3.3.0`, read vocab views, skip `LoadVocabFromSchema`) using the separate ETL login and `/run/secrets/etl_password`, **never** the inherited admin credentials; record the verified call in PROVENANCE.md. Do not claim this plan runnable until the ETL call and both branches of the failure handler pass a real load test. `/db-omop-csv` and `/webapi` are read-only mounts; the latter is a hard dependency.
 
 - [ ] **Step 3: Add compose service + `bin/refresh-csv`**
 
@@ -284,14 +344,14 @@ applying it on every refresh is idempotent. `/db-omop-csv` and `/webapi` are rea
       - ${DATA_ROOT:-./data}:/data
       - ./db/omop_csv:/db-omop-csv:ro
       - ./db/webapi:/webapi:ro
-    secrets: [postgres_password]
+    secrets: [postgres_password, etl_password]
     restart: "no"
 ```
 
 No `env_file` (consistent with existing services). Read-only mounts give `run.sh` the
 versioned DDL and the WebAPI plan's recreate script without cross-plan file copies.
 
-`bin/refresh-csv`: stop `mcp_server`+`ohdsi_webapi` if running, `compose run --rm etl_synthea "$@"`, restart on success only, propagate exit code. Make executable.
+`bin/refresh-csv`: stop `mcp_server`+`ohdsi_webapi` if running, `compose run --rm etl_synthea "$@"`, restart WebAPI, recreate `webapi_register` as a normal Compose one-shot service (`compose up -d --force-recreate webapi_register`), then start MCP only after that job completes successfully and source mapping validates; propagate failures. `--rebuild-accepted` must be the only way to reload when inbox is empty. Make executable.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -302,10 +362,10 @@ git add docker/etl_synthea compose.yaml bin/refresh-csv
 git commit -m "feat: add csv refresh etl-synthea pipeline"
 ```
 
-Expected: image builds; flow test passes; live load verified by the operator-UX plan's end-to-end test (not here).
+Expected: image builds; flow test passes. Add tests for valid 8-6-8 vs invalid 4-6-8 IDs, lock contention, stale `pending/`, missing results script, checksum corruption, post-claim failure rejection, full-snapshot manifest, and accepted-only recovery. Operator-UX live test verifies real load and no stale results.
 
 ## Stop Rules
 
 - Stop if ETL-Synthea 2.1.1 CLI differs from assumed — use its README/`?RunETLSynthea` help, record real invocation, do not invent flags.
 - Stop before dropping the `omop_csv` schema or any vocab view — truncate clinical tables only.
-- Stop on partial accept (some batches moved, some not) — the whole refresh set moves to exactly one of `success/`/`rejected/` per run.
+- Stop on partial accept (some batches moved, some not); keep services stopped and require manual reconciliation. A set of per-batch directory renames is not atomic across a crash.
