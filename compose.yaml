@@ -40,6 +40,7 @@ services:
       - ./db/bootstrap:/bootstrap:ro
     secrets:
       - postgres_password
+      - etl_password
     command: ["/bootstrap/run.sh"]
     restart: "no"
 
@@ -84,3 +85,5 @@ services:
 secrets:
   postgres_password:
     file: ${DATA_ROOT:-./data}/secrets/postgres_password
+  etl_password:
+    file: ${DATA_ROOT:-./data}/secrets/etl_password

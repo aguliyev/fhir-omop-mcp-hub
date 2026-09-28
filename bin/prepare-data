@@ -43,6 +43,17 @@ if [ ! -s "$pw" ]; then
 fi
 chmod 0600 "$pw"
 
+# Separate ignored ETL secret (CSV refresh plan): dedicated login role for the
+# R ETL, never the admin password. Generated mode 0600, never printed.
+etl_pw="$DATA_ROOT/secrets/etl_password"
+if [ ! -s "$etl_pw" ]; then
+  umask 077
+  openssl rand -hex 32 >"$etl_pw.tmp"
+  chmod 0600 "$etl_pw.tmp"
+  mv "$etl_pw.tmp" "$etl_pw"
+fi
+chmod 0600 "$etl_pw"
+
 # Canonicalize the ignored local env only when DATA_ROOT came from the file or
 # defaults (M2): an environment override (e.g. tests) must not leak into etc/setup.env.
 env_file="$REPO_ROOT/etc/setup.env"
