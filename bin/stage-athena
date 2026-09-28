@@ -63,10 +63,12 @@ EOF
   [ -f "$found" ] || die "$base: not a regular file: $found"
   [ -s "$found" ] || die "$base: file is empty"
   hdr="$(sed -n '1p' "$found")"
+  hdr="${hdr%$'\r'}"
+  hdr="${hdr#$'\xef\xbb\xbf'}"
   [ "$(expected_header "$base")" = "$hdr" ] || die "$base: wrong header (expected OMOP CDM 5.3.1 tab-delimited header)"
   case "$hdr" in *"$T"*) ;; *) die "$base: not tab-delimited" ;; esac
   case "$hdr" in *,*) die "$base: comma-delimited, expected tab-delimited" ;; esac
-  lines="$(wc -l <"$found" | tr -d ' ')"
+  lines="$(awk 'END { print NR }' "$found")"
   [ "$lines" -ge 2 ] || die "$base: needs at least one data row"
   # Second line must be non-empty after the header.
   second="$(sed -n '2p' "$found")"

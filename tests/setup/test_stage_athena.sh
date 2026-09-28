@@ -185,6 +185,17 @@ if DATA_ROOT="$S1" "$REPO_ROOT/bin/prepare-data" >/dev/null 2>&1; then ok "no-ne
 S2="$TMP/sen2"; mkdir -p "$S2"; printf 'fhir_omop_mcp_hub\n' >"$S2/.fhir_omop_mcp_hub_data_root"
 if DATA_ROOT="$S2" "$REPO_ROOT/bin/prepare-data" >/dev/null 2>&1; then ok "newline sentinel accepted"; else bad "newline sentinel accepted"; fi
 
+# 21. Equivalent Athena text encodings must not fail header/row validation.
+rm -rf "$DATA_ROOT/athena_input"
+D="$(cpdir)"; awk '{printf "%s\r\n", $0}' "$FIX/CONCEPT.csv" >"$D/CONCEPT.csv"
+expect_ok "CRLF header accepted" "$STAGE" "$D"
+rm -rf "$DATA_ROOT/athena_input"
+D="$(cpdir)"; { printf '\357\273\277'; cat "$FIX/CONCEPT.csv"; } >"$D/CONCEPT.csv"
+expect_ok "UTF-8 BOM header accepted" "$STAGE" "$D"
+rm -rf "$DATA_ROOT/athena_input"
+D="$(cpdir)"; awk 'NR == 1 { print; next } { printf "%s", $0 }' "$FIX/CONCEPT.csv" >"$D/CONCEPT.csv"
+expect_ok "last data row without newline accepted" "$STAGE" "$D"
+
 export DATA_ROOT="$TMP/data"
 
 if [ "$fail" -ne 0 ]; then printf 'stage-athena: FAILED\n'; exit 1; fi
