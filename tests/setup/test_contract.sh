@@ -26,6 +26,16 @@ assert_exists "bin/check-prerequisites"
 assert_exists "tests/setup/test_contract.sh"
 assert_executable "bin/lib/common.sh"
 assert_executable "bin/check-prerequisites"
+if git -C "$REPO_ROOT" ls-files --error-unmatch bin/lib/common.sh >/dev/null 2>&1; then
+  ok "bin/lib/common.sh is tracked"
+else
+  bad "bin/lib/common.sh is tracked"
+fi
+if (cd /tmp && DATA_ROOT=./data bash -c '. "$1/bin/lib/common.sh"; [ "$DATA_ROOT" = "$1/data" ]' _ "$REPO_ROOT"); then
+  ok "relative DATA_ROOT resolves from repository root"
+else
+  bad "relative DATA_ROOT resolves from repository root"
+fi
 
 # .gitignore covers generated state.
 for p in data etc/setup.env .env; do
