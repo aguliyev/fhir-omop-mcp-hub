@@ -4,11 +4,12 @@
 set -eu
 : "${POPULATION_SIZE:=100}"
 REF="${SYNTHEA_REFERENCE_DATE:-20240101}"
+DATA_DIR="${DATA_DIR:-/data}"
 
 # Seed check: reject duplicate patient seeds already in inbox/ or success/
 is_seed_used() {
   local s="$1"
-  for dir in /data/csv_input/inbox /data/csv_input/success /data/fhir_input/inbox /data/fhir_input/success; do
+  for dir in "$DATA_DIR/csv_input/inbox" "$DATA_DIR/csv_input/success" "$DATA_DIR/fhir_input/inbox" "$DATA_DIR/fhir_input/success"; do
     [ -d "$dir" ] || continue
     for mf in "$dir"/*/batch.json; do
       [ -f "$mf" ] || continue

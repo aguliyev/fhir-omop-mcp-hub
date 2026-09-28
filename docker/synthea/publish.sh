@@ -3,10 +3,11 @@
 set -eu
 SRC="$1"; BID="$2"; SEED="$3"; POP="$4"; CSEED="$5"; REF="$6"
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-for q in csv_input fhir_input; do mkdir -p "/data/$q/inbox" "/data/$q/pending" "/data/$q/success" "/data/$q/rejected"; done
-C_STAGE="/data/csv_input/.staging-$BID"; F_STAGE="/data/fhir_input/.staging-$BID"
-F_DEST="/data/fhir_input/inbox/$BID"
-for d in "$C_STAGE" "$F_STAGE" "/data/csv_input/inbox/$BID" "/data/fhir_input/inbox/$BID"; do
+DATA_DIR="${DATA_DIR:-/data}"
+for q in csv_input fhir_input; do mkdir -p "$DATA_DIR/$q/inbox" "$DATA_DIR/$q/pending" "$DATA_DIR/$q/success" "$DATA_DIR/$q/rejected"; done
+C_STAGE="$DATA_DIR/csv_input/.staging-$BID"; F_STAGE="$DATA_DIR/fhir_input/.staging-$BID"
+F_DEST="$DATA_DIR/fhir_input/inbox/$BID"
+for d in "$C_STAGE" "$F_STAGE" "$DATA_DIR/csv_input/inbox/$BID" "$DATA_DIR/fhir_input/inbox/$BID"; do
   [ ! -e "$d" ] || { echo "FAIL: batch path exists: $d" >&2; exit 1; }
 done
 mkdir -p "$C_STAGE" "$F_STAGE"
@@ -27,5 +28,5 @@ cmp "$C_STAGE/batch.json" "$F_STAGE/batch.json" || { echo "FAIL: batch.json mism
 (cd "$C_STAGE" && sha256sum -c files.sha256 >/dev/null)
 (cd "$F_STAGE" && sha256sum -c files.sha256 >/dev/null)
 mv -T "$F_STAGE" "$F_DEST"
-mv -T "$C_STAGE" "/data/csv_input/inbox/$BID"
+mv -T "$C_STAGE" "$DATA_DIR/csv_input/inbox/$BID"
 PUBLISHED=1

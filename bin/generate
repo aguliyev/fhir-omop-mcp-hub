@@ -1,0 +1,12 @@
+#!/bin/bash
+# bin/generate [population] — runs synthea once, asserts matched inbox pair.
+set -eu; cd "$(dirname "$0")/.."
+. bin/lib/common.sh
+POP="${1:-${POPULATION_SIZE:-100}}"
+export POPULATION_SIZE="$POP"
+OUT="$(compose run --rm synthea)"
+BID="$(printf '%s\n' "$OUT" | sed -n 's/^GENERATED batch=\([^ ]*\) .*/\1/p')"
+[ -n "$BID" ] || die "generator did not report a batch ID"
+[ -d "$DATA_ROOT/csv_input/inbox/$BID" ] && [ -d "$DATA_ROOT/fhir_input/inbox/$BID" ] || die "missing matched batch $BID"
+cmp "$DATA_ROOT/csv_input/inbox/$BID/batch.json" "$DATA_ROOT/fhir_input/inbox/$BID/batch.json" || die "batch manifest mismatch $BID"
+echo "OK: batch=$BID"
