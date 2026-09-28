@@ -9,3 +9,7 @@ PGPASSWORD="$(cat "${POSTGRES_PASSWORD_FILE:-/run/secrets/postgres_password}")";
 psql -v ON_ERROR_STOP=1 -c "DROP SCHEMA IF EXISTS omop_csv_results CASCADE; CREATE SCHEMA omop_csv_results;"
 psql -v ON_ERROR_STOP=1 -c "DROP SCHEMA IF EXISTS omop_csv_temp CASCADE; CREATE SCHEMA omop_csv_temp;"
 psql -v ON_ERROR_STOP=1 -f "$(dirname "$0")/results_ddl.sql"
+# DROP SCHEMA wipes grants: restore the ETL login's staging access
+# (db/bootstrap/schemas.sql is the source of truth; keep in sync).
+psql -v ON_ERROR_STOP=1 -c "GRANT USAGE, CREATE ON SCHEMA omop_csv_temp TO etl_loader;"
+psql -v ON_ERROR_STOP=1 -c "ALTER DEFAULT PRIVILEGES FOR ROLE postgres, etl_loader IN SCHEMA omop_csv_temp GRANT ALL ON TABLES TO etl_loader;"
