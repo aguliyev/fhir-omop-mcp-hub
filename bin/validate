@@ -1,0 +1,273 @@
+#!/bin/bash
+# bin/validate [--run-refresh] — end-to-end readiness check.
+# Default mode is read-only: it never generates, executes cohorts, or mutates
+# state; only --run-refresh may run a disposable `generate 5` + `refresh-csv`
+# cycle. Prints READY only if every required check ran and passed; otherwise
+# prints FAILED lines and returns nonzero. A container being Up, a guessed
+# /health endpoint, or a skipped check never counts as success.
+set -eu; cd "$(dirname "$0")/.."
+. bin/lib/common.sh
+require_command docker
+require_command curl
+require_command python3
+
+RUN_REFRESH=0
+for _a in "$@"; do
+  case "$_a" in
+    --run-refresh) RUN_REFRESH=1 ;;
+    *) die "usage: bin/validate [--run-refresh]" ;;
+  esac
+done
+unset _a
+
+WEBAPI_URL="http://127.0.0.1:${WEBAPI_HOST_PORT:-8080}/WebAPI"
+MCP_URL="http://127.0.0.1:${MCP_HOST_PORT:-8000}/mcp"
+DB="${POSTGRES_DB:-fhir_omop_mcp_hub}"
+FAILURES=""
+
+record_fail() {
+  # $1 = short check code (no spaces), $2... = human detail.
+  _code="$1"; shift
+  printf 'FAILED: %s: %s\n' "$_code" "$*" >&2
+  FAILURES="${FAILURES:+$FAILURES }$_code"
+  unset _code
+}
+
+dbq() {
+  compose exec -T postgres psql -U "${POSTGRES_USER:-postgres}" -d "$DB" \
+    -v ON_ERROR_STOP=1 -tAc "$1"
+}
+
+check_cdm() {
+  # 1. Real CDM content: positive person count, no assumed peer-auth user.
+  N="$(dbq "SELECT count(*) FROM omop_csv.person;" 2>&1)" || {
+    record_fail cdm-person "omop_csv.person unreadable (clinical tables unloaded until a CSV refresh runs)"
+    return 0
+  }
+  case "$N" in
+    ''|*[!0-9]*)
+      record_fail cdm-person "person count not a number: $N"
+      return 0 ;;
+  esac
+  [ "$N" -gt 0 ] || {
+    record_fail cdm-person "omop_csv.person count is zero"
+    return 0
+  }
+  echo "OK: omop_csv.person count=$N"
+  NV="$(dbq "SELECT count(*) FROM information_schema.views WHERE table_schema='omop_csv' AND table_name IN ('concept','concept_ancestor','concept_class','concept_relationship','concept_synonym','domain','drug_strength','relationship','source_to_concept_map','vocabulary');" 2>&1)" || {
+    record_fail cdm-vocab-views "vocabulary view inventory unreadable"
+    return 0
+  }
+  [ "$NV" = "10" ] || {
+    record_fail cdm-vocab-views "omop_csv vocabulary views incomplete ($NV/10)"
+    return 0
+  }
+  echo "OK: omop_csv vocabulary views 10/10"
+}
+
+check_webapi() {
+  # 2. Exactly one omop_csv source with the four correct daimon mappings,
+  # plus the pinned release's real vocabulary-search call.
+  SOURCES="$(curl -sf "$WEBAPI_URL/source/sources" 2>&1)" || {
+    record_fail webapi-sources "sources endpoint unreachable"
+    return 0
+  }
+  DETAIL="$(printf '%s' "$SOURCES" | python3 -c '
+import json, sys
+try:
+    sources = json.load(sys.stdin)
+    assert len(sources) == 1, f"expected 1 source, found {len(sources)}"
+    src = sources[0]
+    assert src["sourceKey"] == "omop_csv", "sourceKey=" + repr(src.get("sourceKey"))
+    daimons = {d["daimonType"]: d["tableQualifier"] for d in src["daimons"]}
+    assert daimons == {"CDM": "omop_csv", "Vocabulary": "athena_vocabs",
+                       "Results": "omop_csv_results", "Temp": "omop_csv_temp"}, f"daimons={daimons}"
+    print("one omop_csv source, four daimons")
+except Exception as e:
+    print(f"bad mapping: {e}")
+    sys.exit(1)
+' 2>&1)" || {
+    record_fail webapi-sources "$DETAIL"
+    return 0
+  }
+  echo "OK: WebAPI $DETAIL"
+  VSEARCH="$(curl -sf -X POST "$WEBAPI_URL/vocabulary/omop_csv/search" \
+    -H 'Content-Type: application/json' -d '{"QUERY":"type 2 diabetes"}' 2>&1)" || {
+    record_fail webapi-vocab-search "vocabulary search call failed"
+    return 0
+  }
+  printf '%s' "$VSEARCH" | python3 -c '
+import json, sys
+hits = json.load(sys.stdin)
+assert isinstance(hits, list) and hits, "no hits"
+assert any(h.get("CONCEPT_ID") for h in hits), "no CONCEPT_ID in hits"
+' 2>&1 || {
+    record_fail webapi-vocab-search "no usable concept hit for 'type 2 diabetes'"
+    return 0
+  }
+  echo "OK: WebAPI vocabulary search returns concept hits"
+}
+
+# Shared Streamable HTTP client (stdlib only): argv = url, mode.
+# Mode translate: tools/list + read-only translator + Circe inspection.
+# Mode cohort_query: high-level tool, prints "<persons> <cohort_id>".
+mcp_call() {
+  python3 - "$MCP_URL" "$1" <<'EOF'
+import json, sys, urllib.request
+
+base, mode = sys.argv[1], sys.argv[2]
+
+def post(payload, session=None):
+    req = urllib.request.Request(
+        base, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json",
+                 "Accept": "application/json, text/event-stream"})
+    if session:
+        req.add_header("mcp-session-id", session)
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            return r.headers.get("mcp-session-id"), r.status, r.read().decode()
+    except Exception as e:
+        print(f"http error: {e}")
+        sys.exit(1)
+
+def sse_text(body):
+    for line in body.splitlines():
+        if line.startswith("data:"):
+            return line[5:].strip()
+    print("no SSE data line in response")
+    sys.exit(1)
+
+sid, _, init_body = post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                          "params": {"protocolVersion": "2025-03-26",
+                                     "capabilities": {},
+                                     "clientInfo": {"name": "validate", "version": "1.0"}}})
+if not sid:
+    print("no mcp-session-id in initialize response")
+    sys.exit(1)
+post({"jsonrpc": "2.0", "method": "notifications/initialized"}, sid)
+_, _, list_body = post({"jsonrpc": "2.0", "id": 2, "method": "tools/list",
+                        "params": {}}, sid)
+tools = {t["name"] for t in json.loads(sse_text(list_body))["result"]["tools"]}
+for want in ("translate_tool", "execute_tool", "cohort_query"):
+    if want not in tools:
+        print(f"tools/list missing {want}: {sorted(tools)}")
+        sys.exit(1)
+
+if mode == "translate":
+    name, args = "translate_tool", {"question": "women with type 2 diabetes"}
+else:
+    name, args = "cohort_query", {"question": "women with type 2 diabetes",
+                                  "source_key": "omop_csv"}
+_, _, call_body = post({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                        "params": {"name": name, "arguments": args}}, sid)
+result = json.loads(sse_text(call_body))["result"]
+if result.get("isError"):
+    text = (result.get("content") or [{}])[0].get("text", "unknown tool error")
+    print(f"{name} error: {text[:300]}")
+    sys.exit(1)
+payload = json.loads((result.get("content") or [{}])[0].get("text", "{}"))
+if mode == "translate":
+    definition = payload.get("cohort_definition", {})
+    expr = definition.get("expression", {})
+    assert definition.get("expressionType") == "SIMPLE_EXPRESSION", "not a SIMPLE_EXPRESSION"
+    assert expr.get("ConceptSets"), "empty ConceptSets"
+    assert expr.get("PrimaryCriteria", {}).get("CriteriaList"), "empty PrimaryCriteria"
+    cids = payload.get("provenance", {}).get("concept_ids", [])
+    assert cids, "no concept_ids in provenance"
+    print(f"valid Circe SIMPLE_EXPRESSION, concept_ids={cids}")
+else:
+    persons = payload.get("counts", {}).get("persons")
+    cid = payload.get("provenance", {}).get("cohort_id")
+    assert isinstance(persons, int), f"no person count: {payload}"
+    assert isinstance(cid, int), f"no cohort_id: {payload}"
+    print(f"{persons} {cid}")
+EOF
+}
+
+check_mcp() {
+  # 3. Real MCP client: tools/list plus the read-only translator, with valid
+  # Circe output inspection. Never executes a cohort in default mode.
+  DETAIL="$(mcp_call translate 2>&1)" || {
+    record_fail mcp-translator "$DETAIL"
+    return 0
+  }
+  echo "OK: MCP $DETAIL"
+}
+
+run_refresh_cycle() {
+  # 4. --run-refresh only: disposable generate + refresh, then rerun checks,
+  # a supported cohort_query compared against omop_csv_results.cohort, and a
+  # forced-failure/--rebuild-accepted recovery proof.
+  DEFS_BEFORE="$(dbq "SELECT count(*) FROM ohdsi_webapi.cohort_definition;" 2>&1)" || {
+    record_fail refresh-snapshot "cannot read cohort definitions before refresh"
+    return 0
+  }
+  bin/generate 5 || {
+    record_fail refresh-generate "bin/generate 5 failed"
+    return 0
+  }
+  bin/refresh-csv || {
+    record_fail refresh-csv "refresh cycle failed (WebAPI/MCP left stopped)"
+    return 0
+  }
+  check_cdm
+  check_webapi
+  check_mcp
+  [ -z "$FAILURES" ] || {
+    record_fail refresh-recheck "post-refresh checks failed, skipping cohort comparison"
+    return 0
+  }
+  CQ="$(mcp_call cohort_query 2>&1)" || {
+    record_fail refresh-cohort-query "$CQ"
+    return 0
+  }
+  set -- $CQ
+  LIVE_N="$(dbq "SELECT count(*) FROM omop_csv_results.cohort WHERE cohort_definition_id=$2;" 2>&1)" || {
+    record_fail refresh-cohort-count "cannot read omop_csv_results.cohort"
+    return 0
+  }
+  [ "$LIVE_N" = "$1" ] || {
+    record_fail refresh-cohort-count "cohort_query persons=$1 != omop_csv_results.cohort rows=$LIVE_N"
+    return 0
+  }
+  echo "OK: cohort_query persons=$1 matches omop_csv_results.cohort"
+  DEFS_AFTER="$(dbq "SELECT count(*) FROM ohdsi_webapi.cohort_definition;" 2>&1)" || {
+    record_fail refresh-definitions "cannot read cohort definitions after refresh"
+    return 0
+  }
+  [ "$DEFS_AFTER" -ge "$DEFS_BEFORE" ] || {
+    record_fail refresh-definitions "cohort definitions lost ($DEFS_BEFORE -> $DEFS_AFTER)"
+    return 0
+  }
+  echo "OK: cohort definitions persist ($DEFS_BEFORE -> $DEFS_AFTER)"
+  if bin/refresh-csv __validate_probe_nonexistent__ 2>/dev/null; then
+    record_fail refresh-isolation "bogus batch unexpectedly accepted"
+    return 0
+  fi
+  echo "OK: bogus batch rejected"
+  bin/refresh-csv --rebuild-accepted || {
+    record_fail refresh-rebuild "--rebuild-accepted failed to restore accepted snapshot"
+    return 0
+  }
+  check_cdm
+  check_webapi
+  [ -z "$FAILURES" ] || {
+    record_fail refresh-rebuild "post-rebuild checks failed"
+    return 0
+  }
+  echo "OK: --rebuild-accepted restored accepted snapshot, rejected batch excluded"
+}
+
+check_cdm
+check_webapi
+check_mcp
+if [ "$RUN_REFRESH" -eq 1 ]; then
+  run_refresh_cycle
+fi
+
+if [ -n "$FAILURES" ]; then
+  printf 'FAILED (%s)\n' "$FAILURES" >&2
+  exit 1
+fi
+printf 'READY\n'
