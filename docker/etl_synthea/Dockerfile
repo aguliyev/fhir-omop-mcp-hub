@@ -17,7 +17,8 @@ RUN echo "${ETLSYNTHEA_SHA256}  /opt/etl-synthea.tar.gz" | sha256sum -c - \
 ARG PGJDBC_VERSION=42.7.4
 ARG PGJDBC_SHA256=188976721ead8e8627eb6d8389d500dccc0c9bebd885268a3047180274a6031e
 ADD https://jdbc.postgresql.org/download/postgresql-${PGJDBC_VERSION}.jar /opt/jdbc/postgresql.jar
-RUN echo "${PGJDBC_SHA256}  /opt/jdbc/postgresql.jar" | sha256sum -c -
+RUN echo "${PGJDBC_SHA256}  /opt/jdbc/postgresql.jar" | sha256sum -c - \
+  && mv /opt/jdbc/postgresql.jar "/opt/jdbc/postgresql-${PGJDBC_VERSION}.jar"
 RUN R -e 'install.packages(c("DatabaseConnector","SqlRender","CommonDataModel","dplyr","readr","data.table","httr"), repos="https://cloud.r-project.org")' \
   && R CMD INSTALL /opt/etl-synthea.tar.gz
 COPY run.sh run_etl.R assemble.py clean.sql /opt/etl-synthea/job/
