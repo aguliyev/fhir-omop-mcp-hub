@@ -46,8 +46,13 @@
   verbatim as the schema prefix), `priority` (`0` = active; soft-delete sets
   `-1` via `@SQLDelete`).
 - `db/webapi/register_source.sql` upserts by the real `source_key` UNIQUE
-  constraint and DELETEs+re-inserts the four daimons in one transaction, so
-  repeats update the same source and never duplicate daimon rows.
+  constraint and DELETEs+re-inserts the four daimons as separate statements in
+  one transaction, so repeats update the same source and never duplicate daimon
+  rows. Live-proved 2026-09-28: `source_daimon` also carries
+  `UNIQUE (source_id, daimon_type)` (constraint `un_source_daimon`); a
+  single-statement `WITH ... DELETE ... INSERT` on that table re-inserts
+  against the pre-statement snapshot and fails on the second run with a
+  duplicate-key violation — hence the separate statements.
 - v1 source mapping (single source): `omop_csv` → CDM `omop_csv`,
   Vocabulary `athena_vocabs`, Results `omop_csv_results`, Temp `omop_csv_temp`.
 

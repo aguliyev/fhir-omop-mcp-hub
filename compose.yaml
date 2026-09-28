@@ -110,6 +110,23 @@ services:
       start_period: 120s
     restart: unless-stopped
 
+  webapi_register:
+    image: ${POSTGRES_IMAGE:-docker.io/library/postgres:16.4-alpine@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c}
+    platform: linux/amd64
+    depends_on:
+      ohdsi_webapi: {condition: service_healthy}
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-postgres}
+      PGDATABASE: ${POSTGRES_DB:-fhir_omop_mcp_hub}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    volumes:
+      - ./db/webapi:/webapi:ro
+    secrets: [postgres_password]
+    command: ["/webapi/register.sh"]
+    restart: "no"
+
 # Extensible: Task 5+ adds webapi/mcp services. Keep postgres/db_init unchanged.
 
 secrets:

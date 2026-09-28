@@ -3,13 +3,19 @@
 --   * ohdsi_webapi.source has UNIQUE (source_key); upsert by that constraint.
 --   * ohdsi_webapi.source_daimon.daimon_type is the ORDINAL of
 --     SourceDaimon.DaimonType { CDM=0, Vocabulary=1, Results=2, Temp=5 }.
+--   * ohdsi_webapi.source_daimon has UNIQUE (source_id, daimon_type)
+--     (constraint un_source_daimon, confirmed live 2026-09-28).
 --   * Credentials travel in the JDBC URL (parsed first by DataSourceDTOParser);
 --     username/password columns stay NULL (they are Hibernate-encrypted).
 -- Requires psql variable: -v source_password=<postgres password> (from
 -- /run/secrets/postgres_password via db/webapi/register.sh; never tracked).
 -- Run ONLY after WebAPI has migrated its metadata (webapi_register job),
 -- never from db_init. Re-runnable: same source row, exactly four daimons.
--- v1 registers omop_csv ONLY; omop_fhir stays unregistered.
+-- NOTE: daimon DELETE+INSERT are separate statements on purpose. A single
+-- WITH ... DELETE ... INSERT on the same table re-inserts against the
+-- pre-statement snapshot and fails on rerun with a duplicate-key violation
+-- on un_source_daimon (proven live); separate commands each see the prior
+-- command's effects. v1 registers omop_csv ONLY; omop_fhir stays unregistered.
 
 -- psql parses :'var' only inside the script; fail fast if unset.
 \if :{?source_password}
@@ -20,29 +26,26 @@
 
 BEGIN;
 
-WITH upsert AS (
-  INSERT INTO ohdsi_webapi.source (source_name, source_key, source_connection, source_dialect)
-  VALUES (
-    'SYNTHETIC OMOP CSV',
-    'omop_csv',
-    'jdbc:postgresql://postgres:5432/fhir_omop_mcp_hub?user=postgres&password=' || :'source_password',
-    'postgresql'
-  )
-  ON CONFLICT (source_key) DO UPDATE SET
-    source_name = EXCLUDED.source_name,
-    source_connection = EXCLUDED.source_connection,
-    source_dialect = EXCLUDED.source_dialect
-  RETURNING source_id
-),
-del AS (
-  DELETE FROM ohdsi_webapi.source_daimon
-  USING upsert
-  WHERE source_daimon.source_id = upsert.source_id
-  RETURNING source_daimon.source_id
+-- Upsert by the real source_key UNIQUE constraint; repeats update one row.
+INSERT INTO ohdsi_webapi.source (source_name, source_key, source_connection, source_dialect)
+VALUES (
+  'SYNTHETIC OMOP CSV',
+  'omop_csv',
+  'jdbc:postgresql://postgres:5432/fhir_omop_mcp_hub?user=postgres&password=' || :'source_password',
+  'postgresql'
 )
+ON CONFLICT (source_key) DO UPDATE SET
+  source_name = EXCLUDED.source_name,
+  source_connection = EXCLUDED.source_connection,
+  source_dialect = EXCLUDED.source_dialect;
+
+-- Rebuild this source's four daimons (delete stale first so repeats converge).
+DELETE FROM ohdsi_webapi.source_daimon
+WHERE source_id = (SELECT source_id FROM ohdsi_webapi.source WHERE source_key = 'omop_csv');
+
 INSERT INTO ohdsi_webapi.source_daimon (source_id, daimon_type, table_qualifier, priority)
-SELECT upsert.source_id, d.daimon_type, d.table_qualifier, 0
-FROM upsert
+SELECT s.source_id, d.daimon_type, d.table_qualifier, 0
+FROM (SELECT source_id FROM ohdsi_webapi.source WHERE source_key = 'omop_csv') s
 CROSS JOIN (VALUES
   (0, 'omop_csv'),
   (1, 'athena_vocabs'),
