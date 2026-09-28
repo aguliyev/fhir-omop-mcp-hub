@@ -1,0 +1,35 @@
+#!/bin/bash
+# bin/refresh-csv [--rebuild-accepted | batch_id...] — full CSV refresh cycle.
+# Stops WebAPI/MCP before the destructive load, restarts only after load +
+# validation succeed. A failed refresh leaves tables unexposed until rerun.
+# --rebuild-accepted is the only way to reload when inbox is empty (run.sh
+# reports NOOP for a normal empty-inbox run instead of reloading).
+set -eu; cd "$(dirname "$0")/.."
+. bin/lib/common.sh
+
+have() { compose config --services 2>/dev/null | grep -qx "$1"; }
+stop_if_present() { if have "$1"; then compose stop "$1"; else true; fi; }
+
+stop_if_present mcp_server
+stop_if_present ohdsi_webapi
+
+STATUS=0
+compose run --rm etl_synthea "$@" || STATUS=$?
+if [ "$STATUS" -ne 0 ]; then
+  echo "REFRESH_FAILED: etl_synthea exit=$STATUS; WebAPI/MCP stay stopped" >&2
+  exit "$STATUS"
+fi
+
+if have ohdsi_webapi; then
+  compose up -d ohdsi_webapi
+fi
+if have webapi_register; then
+  compose up -d --force-recreate webapi_register
+  compose wait webapi_register || { echo "FAIL: webapi_register did not exit cleanly" >&2; exit 1; }
+  REG_STATUS="$(compose ps --format json webapi_register 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ExitCode", 1))' 2>/dev/null || echo 1)"
+  [ "$REG_STATUS" -eq 0 ] || { echo "FAIL: webapi_register exit=$REG_STATUS" >&2; exit 1; }
+fi
+if have mcp_server; then
+  compose up -d mcp_server
+fi
+echo "OK: refresh complete"

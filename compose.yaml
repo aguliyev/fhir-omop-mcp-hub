@@ -80,6 +80,19 @@ services:
       - ${DATA_ROOT:-./data}:/data
     restart: "no"
 
+  etl_synthea:
+    build: ./docker/etl_synthea
+    platform: linux/amd64
+    depends_on:
+      postgres: {condition: service_healthy}
+      db_init: {condition: service_completed_successfully}
+    volumes:
+      - ${DATA_ROOT:-./data}:/data
+      - ./db/omop_csv:/db-omop-csv:ro
+      - ./db/webapi:/webapi:ro
+    secrets: [postgres_password, etl_password]
+    restart: "no"
+
 # Extensible: Task 5+ adds webapi/mcp services. Keep postgres/db_init unchanged.
 
 secrets:
