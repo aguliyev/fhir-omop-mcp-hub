@@ -1,0 +1,19 @@
+#!/bin/sh
+# bin/generate — build synthea image and generate 2 batches x 2 formats. Failing validation first is expected.
+set -eu
+SPIKE_DIR="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "$SPIKE_DIR/../.." && pwd)"
+DATA_ROOT=$(sed -n 's/^DATA_ROOT=//p' "$REPO_ROOT/etc/setup.env" | head -n 1)
+case "$DATA_ROOT" in /*) ;; *) DATA_ROOT="$REPO_ROOT/$DATA_ROOT";; esac
+WORK="$DATA_ROOT/work/fhir_to_cdm_spike"
+mkdir -p "$WORK/batches" "$WORK/assembled" "$WORK/generated"
+export SPIKE_WORK_DIR="$WORK"
+# shellcheck disable=SC1091
+[ -f "$SPIKE_DIR/.env" ] && . "$SPIKE_DIR/.env"
+export SYNTHEA_REFERENCE_DATE="${SYNTHEA_REFERENCE_DATE:-${SYNTHEA_REFERENCE_DATE:-20240101}}"
+cd "$SPIKE_DIR"
+docker compose build synthea
+docker compose run --rm synthea batch_001 "${SYNTHEA_SEED_1:-8675309}" "${SYNTHEA_CLINICIAN_SEED_1:-9675309}" r4
+docker compose run --rm synthea batch_001 "${SYNTHEA_SEED_1:-8675309}" "${SYNTHEA_CLINICIAN_SEED_1:-9675309}" stu3
+docker compose run --rm synthea batch_002 "${SYNTHEA_SEED_2:-8675310}" "${SYNTHEA_CLINICIAN_SEED_2:-9675310}" r4
+docker compose run --rm synthea batch_002 "${SYNTHEA_SEED_2:-8675310}" "${SYNTHEA_CLINICIAN_SEED_2:-9675310}" stu3

@@ -1,0 +1,20 @@
+#!/bin/sh
+# bin/run-spike — end-to-end reproducer: prerequisites, inputs, vocab, matrix, validation, verdict hint.
+set -eu
+SPIKE_DIR="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "$SPIKE_DIR/../.." && pwd)"
+DATA_ROOT=$(sed -n 's/^DATA_ROOT=//p' "$REPO_ROOT/etc/setup.env" | head -n 1)
+case "$DATA_ROOT" in /*) ;; *) DATA_ROOT="$REPO_ROOT/$DATA_ROOT";; esac
+export DATA_ROOT SPIKE_WORK_DIR="$DATA_ROOT/work/fhir_to_cdm_spike"
+mkdir -p "$SPIKE_WORK_DIR"
+"$SPIKE_DIR/bin/check-prerequisites"
+if [ ! -f "$SPIKE_WORK_DIR/assembled/r4/batch_001_"*.json ] 2>/dev/null; then
+  "$SPIKE_DIR/bin/generate"
+  "$SPIKE_DIR/bin/assemble"
+fi
+"$SPIKE_DIR/tests/validate_input.sh"
+docker compose -f "$SPIKE_DIR/compose.yaml" --env-file "$SPIKE_DIR/.env" up -d postgres >/dev/null
+docker compose -f "$SPIKE_DIR/compose.yaml" --env-file "$SPIKE_DIR/.env" exec -T postgres psql -U spike_admin -d fhir_to_cdm_spike -v ON_ERROR_STOP=1 -f /dev/stdin <"$SPIKE_DIR/db/init.sql" >/dev/null
+docker compose -f "$SPIKE_DIR/compose.yaml" --env-file "$SPIKE_DIR/.env" exec -T -e ATHENA_INPUT_DIR=/data/athena_input/current -e PGUSER=spike_admin -e PGPASSWORD=spike_local_only_change_me -e PGDATABASE=fhir_to_cdm_spike -e PGHOST=localhost postgres sh /dev/stdin <"$SPIKE_DIR/db/load_vocab.sh" >/dev/null
+"$SPIKE_DIR/bin/convert" all || true
+if "$SPIKE_DIR/tests/validate_output_files.sh"; then echo "SPIKE RESULT: a candidate passed file validation (see REPORT.md)"; else echo "SPIKE RESULT: no candidate passed (see REPORT.md verdict)"; fi

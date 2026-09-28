@@ -1,0 +1,27 @@
+#!/bin/sh
+# Spike prerequisite checks. Fails unless repo setup is READY and spike config is sane.
+set -eu
+SPIKE_DIR="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "$SPIKE_DIR/../.." && pwd)"
+fail=0
+ok() { printf 'ok: %s\n' "$1"; }
+bad() { printf 'missing: %s\n' "$1"; fail=1; }
+
+if "$REPO_ROOT/bin/validate-setup" >/dev/null 2>&1; then ok "repository bin/validate-setup reports READY"; else bad "repository bin/validate-setup does not report READY"; fi
+command -v docker >/dev/null 2>&1 && ok "docker available" || bad "docker missing"
+docker compose version >/dev/null 2>&1 && ok "docker compose available" || bad "docker compose missing"
+docker info >/dev/null 2>&1 && ok "docker daemon reachable" || bad "docker daemon unreachable"
+if [ "$(uname -m)" = "x86_64" ]; then ok "platform linux/amd64 native"; else bad "host arch needs emulation"; fi
+
+DATA_ROOT=$(sed -n 's/^DATA_ROOT=//p' "$REPO_ROOT/etc/setup.env" | head -n 1)
+case "$DATA_ROOT" in /*) ;; *) DATA_ROOT="$REPO_ROOT/$DATA_ROOT";; esac
+if [ -z "$DATA_ROOT" ] || [ ! -d "$DATA_ROOT" ]; then bad "canonical DATA_ROOT missing"; else ok "DATA_ROOT=$DATA_ROOT"; fi
+ATHENA_FILES_DIR="$DATA_ROOT/athena_input/current"
+[ -d "$ATHENA_FILES_DIR" ] && ok "ATHENA_FILES_DIR present" || bad "ATHENA_FILES_DIR missing"
+for f in CONCEPT.csv CONCEPT_ANCESTOR.csv CONCEPT_CLASS.csv CONCEPT_RELATIONSHIP.csv CONCEPT_SYNONYM.csv DOMAIN.csv DRUG_STRENGTH.csv RELATIONSHIP.csv VOCABULARY.csv; do
+  [ -f "$ATHENA_FILES_DIR/$f" ] && ok "athena $f present" || bad "athena $f missing"
+done
+[ -f "$ATHENA_FILES_DIR/manifest.sha256" ] && ok "staged manifest.sha256 present" || bad "staged manifest.sha256 missing"
+if git -C "$REPO_ROOT" ls-files -- spikes/fhir_to_cdm/.env spikes/fhir_to_cdm/work | grep -q .; then bad "spike secret tracked"; else ok "no spike secret tracked"; fi
+if [ "$fail" -ne 0 ]; then printf 'BLOCKED: prerequisites unmet\n' >&2; exit 1; fi
+printf 'prerequisites: READY\n'

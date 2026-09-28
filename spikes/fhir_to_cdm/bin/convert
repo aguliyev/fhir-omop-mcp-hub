@@ -1,0 +1,31 @@
+#!/bin/sh
+# bin/convert — one pinned converter invocation per candidate format. Never mixes formats.
+set -eu
+SPIKE_DIR="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "$SPIKE_DIR/../.." && pwd)"
+DATA_ROOT=$(sed -n 's/^DATA_ROOT=//p' "$REPO_ROOT/etc/setup.env" | head -n 1)
+case "$DATA_ROOT" in /*) ;; *) DATA_ROOT="$REPO_ROOT/$DATA_ROOT";; esac
+export DATA_ROOT SPIKE_WORK_DIR="$DATA_ROOT/work/fhir_to_cdm_spike"
+FMT="${1:-all}"
+run_one() {
+  f="$1"
+  rm -rf "$SPIKE_WORK_DIR/generated/$f"
+  mkdir -p "$SPIKE_WORK_DIR/generated/$f" "$SPIKE_WORK_DIR/logs"
+  echo "=== converting $f ==="
+  set +e
+  docker compose -f "$SPIKE_DIR/compose.yaml" --env-file "$SPIKE_DIR/.env" run --rm --build \
+    -e FHIR_INPUT_DIR="/work/assembled/$f" -e CDM_OUTPUT_DIR="/work/generated/$f" \
+    -e VOCAB_SCHEMA=athena_vocabs -e CDM_VERSION=V53 -e CHUNK=4 \
+    converter >"$SPIKE_WORK_DIR/logs/convert_$f.log" 2>&1
+  rc=$?
+  set -e
+  tail -n 5 "$SPIKE_WORK_DIR/logs/convert_$f.log"
+  echo "$f exit=$rc"
+  return "$rc"
+}
+case "$FMT" in
+  r4) run_one r4;;
+  stu3) run_one stu3;;
+  all) r4rc=0; stu3rc=0; run_one r4 || r4rc=$?; run_one stu3 || stu3rc=$?; echo "summary: r4=$r4rc stu3=$stu3rc";;
+  *) echo "usage: convert [r4|stu3|all]" >&2; exit 2;;
+esac

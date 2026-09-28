@@ -369,6 +369,12 @@ directories directly to the two inboxes.
   canonical vocabulary load.
 - Execute the pre-development FhirToCdm container feasibility spike documented
   in `docs/superpowers/plans/2026-09-27-fhir-to-cdm-container-feasibility-spike.md`.
+  Outcome (2026-09-28, evidence in `spikes/fhir_to_cdm/REPORT.md`): `FAILED`.
+  Unmodified FhirToCdm `4991f90` builds and runs on linux/amd64 and loads
+  Athena vocabularies, but its R4-only parser rejects STU3 and its
+  SNOMED/RxNorm/CVX/LOINC-only mapping throws on default Synthea 3.3.0 output
+  (CDT procedures, ICD-10 conditions). Do not patch or fork FhirToCdm; reopen
+  converter selection before any FHIR-path main-plan commitment.
 - After the spike, record the verified FhirToCdm commit, FHIR format, runtime
   image, supported resource subset, loader contract, and platform constraints.
 - Define the exact setup/full-refresh command sequence and failure reporting
