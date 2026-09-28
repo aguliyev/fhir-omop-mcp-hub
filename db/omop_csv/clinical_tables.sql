@@ -6,7 +6,9 @@
 --      (CREATE TABLE IF NOT EXISTS); nothing depends on search_path.
 --   2. Upstream DATETIME2 (a SQL Server-ism left in the "PostgreSQL" file;
 --      PostgreSQL rejects it) is mapped to TIMESTAMP.
--- Upstream typo kept verbatim: cost.reveue_code_source_value ("reveue").
+-- Upstream typo (cost.reveue_code_source_value, "reveue") is FIXED here:
+-- ETL-Synthea 2.1.1 insert_cost_v300.sql addresses the correct spelling
+-- revenue_code_source_value, and the load aborts otherwise (verified live).
 -- No PK/FK constraints or indexes here: truncate/rebuild owns the rows, and
 -- CREATE TABLE IF NOT EXISTS cannot evolve columns — if the pinned CDM/ETL
 -- DDL changes, stop and document a deliberate migration or table recreation.
@@ -116,10 +118,20 @@ CREATE TABLE IF NOT EXISTS omop_csv.cost (
   payer_plan_period_id			INTEGER			NULL ,
   amount_allowed		        NUMERIC			  NULL ,
   revenue_code_concept_id		INTEGER			NULL ,
-  reveue_code_source_value  VARCHAR(50) NULL,
+  revenue_code_source_value  VARCHAR(50) NULL,
   drg_concept_id			      INTEGER		  NULL,
   drg_source_value			    VARCHAR(3)	NULL
 );
+
+-- Migrate tables created before the reveue→revenue fix (no-op afterwards).
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_schema = 'omop_csv' AND table_name = 'cost'
+             AND column_name = 'reveue_code_source_value') THEN
+    ALTER TABLE omop_csv.cost
+      RENAME COLUMN reveue_code_source_value TO revenue_code_source_value;
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS omop_csv.death (
   person_id							  INTEGER			NOT NULL ,

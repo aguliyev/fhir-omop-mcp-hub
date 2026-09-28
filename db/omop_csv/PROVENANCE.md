@@ -31,7 +31,12 @@ from the first occurrence of each block (the upstream file repeats sections).
 2. **`DATETIME2` → `TIMESTAMP`.** The upstream "PostgreSQL" file leaves 19
    SQL Server `DATETIME2` columns; PostgreSQL rejects the type. All 19 map
    to `TIMESTAMP`, nullability unchanged.
-3. **Upstream typo kept verbatim:** `cost.reveue_code_source_value`.
+3. **Upstream typo fixed:** the DDL file spells it
+   `cost.reveue_code_source_value` ("reveue"), but ETL-Synthea 2.1.1
+   `insert_cost_v300.sql` addresses the correct `revenue_code_source_value`
+   and the load aborts otherwise (verified live). Fresh tables get the
+   correct spelling; the `DO` block after the `cost` definition renames the
+   column on pre-existing tables (no-op afterwards).
 4. **No constraints/indexes.** The upstream DDL carries no inline PK/FK
    lines; constraints live in the separate indexes file and are intentionally
    omitted (truncate/rebuild owns the rows). `CREATE TABLE IF NOT EXISTS`
