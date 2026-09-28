@@ -71,19 +71,44 @@
   (header comment records release, command, checksum), qualified with
   `omop_csv_results`, idempotent (`CREATE TABLE IF NOT EXISTS`).
 
-## Endpoints for the MCP plan (class paths from tag v2.15.2; live-proved in Task 4)
+## Endpoints for the MCP plan (live-proved in Tasks 3–4, 2026-09-28)
 
-- `GET /WebAPI/source/sources` → `[{sourceId, sourceName, sourceKey,
-  sourceDialect, ...}]` (`SourceController @Path("/source/") + @Path("sources")`).
-- `GET /WebAPI/vocabulary/{sourceKey}/search/{query}` → `[{conceptId,
-  conceptName, standardConcept, standardConceptCaption, invalidReason,
-  invalidReasonCaption, conceptCode, domainId, vocabularyId, ...}]`
-  (`VocabularyService @Path("vocabulary/")`).
-- `POST /WebAPI/vocabulary/{sourceKey}/search` with `{"QUERY": "..."}`
-  (ConceptSearch) → same shape.
-- `POST /WebAPI/cohortdefinition/` with Atlas/Circe cohort JSON → created
-  definition (`CohortDefinitionService @Path("/cohortdefinition")`).
-- `GET /WebAPI/cohortdefinition/{id}/generate/{sourceKey}` → job resource.
-- `GET /WebAPI/cohortdefinition/{id}/info` → generation list with status
-  and record counts (poll until `COMPLETE`).
-- `GET /WebAPI/ddl/results?...` (above) — results-DDL generator.
+> Correction: vocabulary search returns UPPER_CASE keys (below), not the
+> lowercase names drafted earlier — the shapes here are byte-level live truth.
+
+- `GET /WebAPI/source/sources` → pre-registration `[]`; post-registration
+  (visible after a WebAPI restart — the source list is cached at boot):
+  `[{"sourceId":2,"sourceName":"SYNTHETIC OMOP CSV",
+  "sourceDialect":"postgresql","sourceKey":"omop_csv","daimons":[
+  {"sourceDaimonId":11,"daimonType":"CDM","tableQualifier":"omop_csv","priority":0},
+  {"sourceDaimonId":12,"daimonType":"Vocabulary","tableQualifier":"athena_vocabs","priority":0},
+  {"sourceDaimonId":13,"daimonType":"Results","tableQualifier":"omop_csv_results","priority":0},
+  {"sourceDaimonId":14,"daimonType":"Temp","tableQualifier":"omop_csv_temp","priority":0}]}]`
+  (JSON renders daimon types by NAME; the DB stores the ordinals 0/1/2/5.)
+- `GET /WebAPI/vocabulary/omop_csv/search/diabetes` → 200, JSON array, e.g.
+  `[{"CONCEPT_ID":40387272,"CONCEPT_NAME":"(Diabetes insipidus [& pituitary]) or (vasopressin deficiency)","STANDARD_CONCEPT":"N","STANDARD_CONCEPT_CAPTION":"Non-Standard","INVALID_REASON":"D","INVALID_REASON_CAPTION":"Invalid","CONCEPT_CODE":"190484000","DOMAIN_ID":"Condition","VOCABULARY_ID":"SNOMED","CONCEPT_CLASS_ID":"Disorder","VALID_START_DATE":1012435200000,"VALID_END_DATE":1012435200000},...]`
+  (dates are epoch millis). Proven against 1,918,849 loaded Athena concepts.
+- `POST /WebAPI/vocabulary/omop_csv/search` with `{"QUERY":"diabetes"}`
+  (ConceptSearch) → same array shape.
+- `POST /WebAPI/cohortdefinition/` with
+  `{"name":"...","description":"...","expressionType":"SIMPLE_EXPRESSION","expression":{<Circe>}}`
+  → `{"id":2,"name":"...","expressionType":"SIMPLE_EXPRESSION","expression":{...},"createdDate":...,"hasReadAccess":...,"hasWriteAccess":...}`.
+  (Request fixture: the release's own
+  `src/test/resources/generationcache/cohort/cohortIbuprofenOlder50.json` as `expression`.)
+- `GET /WebAPI/cohortdefinition/{id}/generate/omop_csv` → job resource, e.g.
+  `{"status":"STARTING",...,"executionId":1,"jobParameters":{"jobName":"Generating cohort 2 : SYNTHETIC OMOP CSV (omop_csv)",...,"target_database_schema":"omop_csv_re...","cohort_definition_id":"2","source_id":"2",...}}`.
+- `GET /WebAPI/cohortdefinition/{id}/info` → generation list, e.g.
+  `[{"id":{"cohortDefinitionId":2,"sourceId":2},"startTime":...,"executionDuration":333,"status":"COMPLETE","isValid":false,"isCanceled":false,"failMessage":"...","personCount":null,"recordCount":null,...}]`
+  (poll until status leaves `RUNNING`; counts populate on success).
+- Generation lifecycle works end-to-end (STARTING→RUNNING→COMPLETE), but the
+  probe FAILED with `BadSqlGrammarException` because `omop_csv` clinical tables
+  do not exist yet in this database (ETL has not loaded them — outside this
+  plan). Re-verify counts after the clinical refresh lands; the results
+  tables (`omop_csv_results.cohort`, caches) are the write targets.
+- `GET /WebAPI/ddl/results?dialect=postgresql&schema=omop_csv_results&vocabSchema=athena_vocabs&tempSchema=omop_csv_results&initConceptHierarchy=true`
+  — `db/webapi/results_ddl.sql` is byte-identical to this endpoint's output
+  except the two deviations documented in its header.
+- Two-run registration proven: `webapi_register` run twice → both exit 0
+  (`OK: omop_csv registered (1 source, 4 daimons)`); endpoint still exposes
+  exactly `omop_csv` after a WebAPI restart. Probe cohort definition removed
+  afterwards (DELETE → 204).
