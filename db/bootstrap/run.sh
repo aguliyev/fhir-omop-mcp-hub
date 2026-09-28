@@ -22,7 +22,7 @@ psql -v ON_ERROR_STOP=1 -f /webapi/results_ddl.sql
 [ -s "$ETL_PASSWORD_FILE" ] || { echo "FAIL: missing ETL password file $ETL_PASSWORD_FILE" >&2; exit 1; }
 ETL_TMP="$(mktemp)"; trap 'rm -f "$ETL_TMP"' EXIT
 ETL_PW="$(cat "$ETL_PASSWORD_FILE")"
-printf 'ALTER ROLE etl_loader WITH LOGIN PASSWORD ''%s'';\n' "${ETL_PW//\'/\'\'}" >"$ETL_TMP"
+printf "ALTER ROLE etl_loader WITH LOGIN PASSWORD '%s';\n" "${ETL_PW//\'/\'\'}" >"$ETL_TMP"
 psql -v ON_ERROR_STOP=1 -f "$ETL_TMP"
 rm -f "$ETL_TMP"; trap - EXIT
 unset ETL_PW ETL_TMP
