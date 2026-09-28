@@ -234,8 +234,13 @@ CREATE TABLE IF NOT EXISTS omop_csv.measurement (
   measurement_source_value		  VARCHAR(50)	NULL ,
   measurement_source_concept_id	INTEGER			NULL ,
   unit_source_value				      VARCHAR(50)	NULL ,
-  value_source_value			      VARCHAR(50)	NULL
+  value_source_value			      VARCHAR(255)	NULL
 );
+
+-- Adaptation 5 (see PROVENANCE.md): widen value_source_value on tables
+-- already created with VARCHAR(50). Re-running to the same type is a
+-- harmless no-op, so this stays idempotent under IF NOT EXISTS.
+ALTER TABLE omop_csv.measurement ALTER COLUMN value_source_value TYPE VARCHAR(255);
 
 CREATE TABLE IF NOT EXISTS omop_csv.metadata (
   metadata_concept_id       INTEGER       NOT NULL ,

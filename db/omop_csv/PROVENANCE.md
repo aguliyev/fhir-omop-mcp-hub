@@ -37,3 +37,12 @@ from the first occurrence of each block (the upstream file repeats sections).
    omitted (truncate/rebuild owns the rows). `CREATE TABLE IF NOT EXISTS`
    does not evolve columns: if the pinned CDM/ETL DDL changes, stop and
    document a deliberate migration or table recreation.
+5. **`measurement.value_source_value` widened to `VARCHAR(255)`.**
+   ETL-Synthea 2.1.1 `insert_measurement.sql` maps raw Synthea observation
+   `VALUE` text into this column without truncation (its sibling branch
+   uses `left(o.value,50)`), while real Synthea 3.3.0 survey/SDOH answers
+   reach 135 chars (e.g. homelessness-screening responses). Verbatim
+   `VARCHAR(50)` aborts the whole refresh with `value too long`. Widening
+   preserves generated values exactly; reads (WebAPI, MCP) are unaffected.
+   The unconditional `ALTER COLUMN` after the `CREATE` migrates tables
+   created before this adaptation and is a no-op afterwards.
