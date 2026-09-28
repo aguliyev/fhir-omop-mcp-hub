@@ -69,6 +69,16 @@ services:
     command: ["/athena/load.sh"]
     restart: "no"
 
+  synthea:
+    build: ./docker/synthea
+    platform: linux/amd64
+    environment:
+      POPULATION_SIZE: ${POPULATION_SIZE:-100}
+      SEED: ${SEED:-}
+    volumes:
+      - ${DATA_ROOT:-./data}:/data
+    restart: "no"
+
 # Extensible: Task 5+ adds webapi/mcp services. Keep postgres/db_init unchanged.
 
 secrets:
