@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- WebAPI v2.15.2 property reference for this project (Maven settings format,
+     same convention as upstream dev/settings.xml and sample_settings.xml).
+     NOTE: the prebuilt WAR has no settings.xml loading mechanism at runtime
+     (verified against the v2.15.2 source: no PropertySource/settings loader;
+     application.properties ${...} placeholders resolve from JVM system
+     properties / environment). The live values are applied by
+     docker/webapi/entrypoint.sh via CATALINA_OPTS -D flags; this file is the
+     human-readable record kept in sync with it. Secrets are never stored here:
+     datasource.password comes from /run/secrets/postgres_password. -->
+<settings>
+  <profiles>
+    <profile>
+      <id>webapi-postgresql-fhir-omop-mcp-hub</id>
+      <properties>
+        <datasource.driverClassName>org.postgresql.Driver</datasource.driverClassName>
+        <datasource.url>jdbc:postgresql://postgres:5432/fhir_omop_mcp_hub</datasource.url>
+        <datasource.username>postgres</datasource.username>
+        <datasource.dialect>postgresql</datasource.dialect>
+        <datasource.ohdsi.schema>ohdsi_webapi</datasource.ohdsi.schema>
+        <flyway.datasource.driverClassName>${datasource.driverClassName}</flyway.datasource.driverClassName>
+        <flyway.datasource.url>${datasource.url}</flyway.datasource.url>
+        <flyway.datasource.username>${datasource.username}</flyway.datasource.username>
+        <flyway.locations>classpath:db/migration/postgresql</flyway.locations>
+        <flyway.schemas>${datasource.ohdsi.schema}</flyway.schemas>
+        <flyway.placeholders.ohdsiSchema>${datasource.ohdsi.schema}</flyway.placeholders.ohdsiSchema>
+        <spring.batch.repository.tableprefix>${datasource.ohdsi.schema}.BATCH_</spring.batch.repository.tableprefix>
+        <security.provider>DisabledSecurity</security.provider>
+        <security.origin>*</security.origin>
+        <security.db.datasource.driverClassName>${datasource.driverClassName}</security.db.datasource.driverClassName>
+        <security.db.datasource.url>${datasource.url}</security.db.datasource.url>
+        <security.db.datasource.username>${datasource.username}</security.db.datasource.username>
+        <security.db.datasource.schema>${datasource.ohdsi.schema}</security.db.datasource.schema>
+      </properties>
+    </profile>
+  </profiles>
+</settings>

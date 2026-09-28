@@ -9,9 +9,22 @@
   https://github.com/OHDSI/WebAPI.git` (tag `v2.15.2`).
 - Servlet namespace: **`javax.servlet`** (`javax.servlet:javax.servlet-api` in
   `pom.xml`; entities import `javax.persistence.*`). Tomcat 10 (jakarta) will
-  NOT work. Runtime: `tomcat:9-jre17` (Java target 1.8 runs on JRE 17).
-- Runtime image digest: pinned in `docker/webapi/Dockerfile` (`FROM` with
-  digest; recorded here once pulled at build time).
+  NOT work. Runtime: `tomcat:9-jre11@sha256:65ea4ebaa64d9ee9b109a6d130e1c5c3b55a172756c6fd20558d2caa26a0d6a2`
+  (`linux/amd64`; Temurin 11.0.32.1, pulled 2026-09-28). Java 11 chosen over 17
+  by live proof: on JRE 17 boot fails twice — first the bundled Redshift
+  driver's `JarInJarClassLoader` hits `InaccessibleObjectException` (`java.net`
+  not opened), then after `--add-opens` the bundled cosium
+  `spring-data-jpa-entity-graph` lib fails with `NoSuchFieldException:
+  modifiers` (`Field.modifiers` was removed from the JDK after 11; no flag can
+  restore it). On Java 11 the WAR migrates and serves.
+- Runtime config deviation from the plan: `docker/webapi/settings.xml` is kept
+  as a Maven-format property reference (upstream convention), but it is NOT
+  injected into the webapp — v2.15.2 has no settings.xml loading mechanism
+  (no PropertySource/settings loader in its source; the WAR's
+  `application.properties` `${...}` placeholders resolve from JVM system
+  properties/environment). `docker/webapi/entrypoint.sh` applies the same
+  values via `CATALINA_OPTS -D` flags, reading the password from
+  `/run/secrets/postgres_password`. The WAR is deployed whole (not exploded).
 
 ## Metadata contracts (from `src/main/resources/db/migration/postgresql/`, tag v2.15.2)
 
