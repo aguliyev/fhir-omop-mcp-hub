@@ -11,15 +11,15 @@ export REPO_ROOT
 _stash() { _v="$1"; if [ -n "${!_v+x}" ]; then printf -v "_saved_$_v" '%s' "${!_v}"; else printf -v "_saved_$_v" '__unset__'; fi; }
 _unstash() { _v="$1"; _s="_saved_$_v"; if [ "${!_s}" != '__unset__' ]; then printf -v "$_v" '%s' "${!_s}"; else unset "$_v" || true; fi; }
 case "${DATA_ROOT+x}" in x) _env_has_data_root=1;; *) _env_has_data_root=0;; esac
-for _k in COMPOSE_PROJECT_NAME DATA_ROOT POSTGRES_IMAGE POSTGRES_DB POSTGRES_USER POSTGRES_HOST_PORT VOCAB_VIEW_TARGET_SCHEMAS; do _stash "$_k"; done
+for _k in COMPOSE_PROJECT_NAME DATA_ROOT POSTGRES_IMAGE POSTGRES_DB POSTGRES_USER POSTGRES_HOST_PORT VOCAB_VIEW_TARGET_SCHEMAS POPULATION_SIZE SEED WEBAPI_HOST_PORT MCP_HOST_PORT; do _stash "$_k"; done
 if [ -f "$REPO_ROOT/etc/setup.env" ]; then
   set -a
   # shellcheck disable=SC1090
   . "$REPO_ROOT/etc/setup.env"
   set +a
 fi
-for _k in COMPOSE_PROJECT_NAME DATA_ROOT POSTGRES_IMAGE POSTGRES_DB POSTGRES_USER POSTGRES_HOST_PORT VOCAB_VIEW_TARGET_SCHEMAS; do _unstash "$_k"; done
-unset _k _v _s _stash _unstash _saved_COMPOSE_PROJECT_NAME _saved_DATA_ROOT _saved_POSTGRES_IMAGE _saved_POSTGRES_DB _saved_POSTGRES_USER _saved_POSTGRES_HOST_PORT _saved_VOCAB_VIEW_TARGET_SCHEMAS || true
+for _k in COMPOSE_PROJECT_NAME DATA_ROOT POSTGRES_IMAGE POSTGRES_DB POSTGRES_USER POSTGRES_HOST_PORT VOCAB_VIEW_TARGET_SCHEMAS POPULATION_SIZE SEED WEBAPI_HOST_PORT MCP_HOST_PORT; do _unstash "$_k"; done
+unset _k _v _s _stash _unstash _saved_COMPOSE_PROJECT_NAME _saved_DATA_ROOT _saved_POSTGRES_IMAGE _saved_POSTGRES_DB _saved_POSTGRES_USER _saved_POSTGRES_HOST_PORT _saved_VOCAB_VIEW_TARGET_SCHEMAS _saved_POPULATION_SIZE _saved_SEED _saved_WEBAPI_HOST_PORT _saved_MCP_HOST_PORT || true
 
 # Resolve a path to canonical absolute form WITHOUT creating anything:
 # follows symlinks and collapses '.'/'..' so denylist checks see the real path (H3).
@@ -40,6 +40,10 @@ resolve_path() {
 : "${POSTGRES_USER:=postgres}"
 : "${POSTGRES_HOST_PORT:=5432}"
 : "${VOCAB_VIEW_TARGET_SCHEMAS:=omop_csv}"
+: "${POPULATION_SIZE:=100}"
+: "${SEED:=}"
+: "${WEBAPI_HOST_PORT:=8080}"
+: "${MCP_HOST_PORT:=8000}"
 
 # Resolved absolute DATA_ROOT (no mkdir here; creation belongs to prepare-data).
 # DATA_ROOT_FROM_ENV=1 when the value came from the environment (M2: callers
@@ -48,7 +52,7 @@ DATA_ROOT_FROM_ENV="$_env_has_data_root"
 unset _env_has_data_root || true
 DATA_ROOT="$(resolve_path "$DATA_ROOT")"
 [ -n "$DATA_ROOT" ] || DATA_ROOT="/"
-export COMPOSE_PROJECT_NAME DATA_ROOT DATA_ROOT_FROM_ENV POSTGRES_IMAGE POSTGRES_DB POSTGRES_USER POSTGRES_HOST_PORT VOCAB_VIEW_TARGET_SCHEMAS
+export COMPOSE_PROJECT_NAME DATA_ROOT DATA_ROOT_FROM_ENV POSTGRES_IMAGE POSTGRES_DB POSTGRES_USER POSTGRES_HOST_PORT VOCAB_VIEW_TARGET_SCHEMAS POPULATION_SIZE SEED WEBAPI_HOST_PORT MCP_HOST_PORT
 
 die() {
   printf 'FAIL: %s\n' "$*" >&2
@@ -68,6 +72,6 @@ require_absolute_dir() {
 
 # Owns all Compose flags: canonical file + project. Callers pass subcommands.
 compose() {
-  export DATA_ROOT COMPOSE_PROJECT_NAME POSTGRES_IMAGE POSTGRES_DB POSTGRES_USER POSTGRES_HOST_PORT VOCAB_VIEW_TARGET_SCHEMAS
+  export DATA_ROOT COMPOSE_PROJECT_NAME POSTGRES_IMAGE POSTGRES_DB POSTGRES_USER POSTGRES_HOST_PORT VOCAB_VIEW_TARGET_SCHEMAS POPULATION_SIZE SEED WEBAPI_HOST_PORT MCP_HOST_PORT
   docker compose --file "$REPO_ROOT/compose.yaml" --project-name "$COMPOSE_PROJECT_NAME" "$@"
 }
