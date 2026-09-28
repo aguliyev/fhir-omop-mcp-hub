@@ -102,6 +102,9 @@ services:
       db_init: {condition: service_completed_successfully}
     secrets: [postgres_password]
     ports: ["127.0.0.1:${WEBAPI_HOST_PORT:-8080}:8080"]
+    networks:
+      default:
+        aliases: [ohdsi-webapi] # ponytail: hyphen alias; Tomcat 400s underscores in Host headers
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8080/WebAPI/source/sources || exit 1"]
       interval: 15s
@@ -134,7 +137,7 @@ services:
       ohdsi_webapi: {condition: service_healthy}
       webapi_register: {condition: service_completed_successfully}
     environment:
-      WEBAPI_BASE_URL: http://ohdsi_webapi:8080/WebAPI
+      WEBAPI_BASE_URL: http://ohdsi-webapi:8080/WebAPI
     ports: ["127.0.0.1:${MCP_HOST_PORT:-8000}:8000"]
     restart: unless-stopped
 

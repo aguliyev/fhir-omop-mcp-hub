@@ -26,7 +26,7 @@ fi
 if have webapi_register; then
   compose up -d --force-recreate webapi_register
   compose wait webapi_register || { echo "FAIL: webapi_register did not exit cleanly" >&2; exit 1; }
-  REG_STATUS="$(compose ps --format json webapi_register 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("ExitCode", 1))' 2>/dev/null || echo 1)"
+  REG_STATUS="$(compose ps -a --format json webapi_register 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); d=d[0] if isinstance(d,list) and d else d; print(d.get("ExitCode", 1) if isinstance(d,dict) else 1)' 2>/dev/null || echo 1)"
   [ "$REG_STATUS" -eq 0 ] || { echo "FAIL: webapi_register exit=$REG_STATUS" >&2; exit 1; }
 fi
 if have mcp_server; then
