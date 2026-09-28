@@ -50,4 +50,18 @@ for batch in "$TMP"/neg-success/* "$TMP"/neg-pending/*; do
   printf '{"batch_id":"%s","synthea_version":"3.3.0","seed":12345,"population":1,"generated_at_utc":"2026-09-28T01:45:00Z","csv_files":["organizations.csv","patients.csv"],"fhir_files":[]}' "${batch##*/}" > "$batch/batch.json"
 done
 neg "conflicting reference Id"
+# Aggregate-only reference difference merges (Synthea 3.3.0 per-run counters).
+rm -rf "$TMP/neg-success" "$TMP/neg-pending" "$TMP/neg-out"
+mkdir -p "$TMP/neg-success/20260928-014500-ab12cd34" "$TMP/neg-pending/20260928-014501-ab12cd35"
+cp tests/csv_refresh/fixtures/csv-batch-a/patients.csv "$TMP/neg-success/20260928-014500-ab12cd34/"
+cp tests/csv_refresh/fixtures/csv-batch-b/patients.csv "$TMP/neg-pending/20260928-014501-ab12cd35/"
+printf 'Id,NAME,REVENUE,UTILIZATION\norg1,Same,0.0,13\n' > "$TMP/neg-success/20260928-014500-ab12cd34/organizations.csv"
+printf 'Id,NAME,REVENUE,UTILIZATION\norg1,Same,0.0,168\n' > "$TMP/neg-pending/20260928-014501-ab12cd35/organizations.csv"
+for batch in "$TMP"/neg-success/* "$TMP"/neg-pending/*; do
+  (cd "$batch" && sha256sum patients.csv organizations.csv > files.sha256)
+  printf '{"batch_id":"%s","synthea_version":"3.3.0","seed":12345,"population":1,"generated_at_utc":"2026-09-28T01:45:00Z","csv_files":["organizations.csv","patients.csv"],"fhir_files":[]}' "${batch##*/}" > "$batch/batch.json"
+done
+python3 docker/etl_synthea/assemble.py "$TMP/neg-success" "$TMP/neg-pending" "$TMP/neg-out" | grep -q "1 aggregate-only reference duplicates merged" || { echo "FAIL: aggregate-only merge not reported"; exit 1; }
+[ "$(grep -c '^' "$TMP/neg-out/organizations.csv")" -eq 2 ] || { echo "FAIL: header+1 org row expected"; exit 1; }
+rm -rf "$TMP/neg-success" "$TMP/neg-pending" "$TMP/neg-out"
 echo "PASS: assemble"

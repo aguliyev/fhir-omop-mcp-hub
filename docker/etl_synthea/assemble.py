@@ -7,8 +7,15 @@ Validates every selected batch BEFORE writing any output: directory names must
 match ^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$, batch.json id/seed/population and file
 inventory must check out, and files.sha256 must verify against the actual
 regular CSV files. Tampered success/ data fails without deleting anything.
-Reference tables (organizations/providers/payers) dedupe by Id; conflicting
-duplicate Ids with differing fields fail instead of silently winning.
+Reference tables (organizations/providers/payers) dedupe by Id; duplicate Ids
+whose identity fields differ fail instead of silently winning. Synthea 3.3.0
+regenerates per-run aggregate counters on reference rows (org REVENUE /
+UTILIZATION, provider ENCOUNTERS / PROCEDURES, payer AMOUNT_* / REVENUE /
+COVERED_* / MEMBER_MONTHS / ...); same Id with identical identity fields but
+different counters is expected, not corruption, so those columns are excluded
+from the identity comparison, the first row wins deterministically, and the
+merge is reported. ETL-Synthea 2.1.1 R code never reads these columns, so
+keeping one row is lossless.
 """
 import csv
 import hashlib
@@ -19,6 +26,18 @@ from pathlib import Path
 
 BATCH_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$")
 REFERENCE_TABLES = {"organizations.csv", "providers.csv", "payers.csv"}
+# Per-batch aggregate counters, keyed by table. Only columns present in the
+# header are ignored; anything else differing still fails.
+AGGREGATE_COLUMNS = {
+    "organizations.csv": {"REVENUE", "UTILIZATION"},
+    "providers.csv": {"ENCOUNTERS", "PROCEDURES"},
+    "payers.csv": {"AMOUNT_COVERED", "AMOUNT_UNCOVERED", "REVENUE",
+                   "COVERED_ENCOUNTERS", "UNCOVERED_ENCOUNTERS",
+                   "COVERED_MEDICATIONS", "UNCOVERED_MEDICATIONS",
+                   "COVERED_PROCEDURES", "UNCOVERED_PROCEDURES",
+                   "COVERED_IMMUNIZATIONS", "UNCOVERED_IMMUNIZATIONS",
+                   "UNIQUE_CUSTOMERS", "QOLS_AVG", "MEMBER_MONTHS"},
+}
 
 
 def fail(msg):
@@ -85,6 +104,7 @@ def main():
         fail(f"stale temp output {tmp} (manual recovery required)")
     tmp.mkdir(parents=True)
     try:
+        merged = 0
         for name, files in sorted(tables.items()):
             header = None
             ref_by_id = {}
@@ -111,11 +131,14 @@ def main():
                                 fail(f"ragged row in {f}")
                             if name in REFERENCE_TABLES:
                                 key = row[id_idx]
-                                if key in ref_by_id and ref_by_id[key] != tuple(row):
-                                    fail(f"conflicting {name} Id '{key}'")
+                                ignore = {header.index(c) for c in AGGREGATE_COLUMNS.get(name, ()) if c in header}
+                                ident = tuple(v for i, v in enumerate(row) if i not in ignore)
                                 if key in ref_by_id:
+                                    if ref_by_id[key] != ident:
+                                        fail(f"conflicting {name} Id '{key}'")
+                                    merged += 1
                                     continue
-                                ref_by_id[key] = tuple(row)
+                                ref_by_id[key] = ident
                             w.writerow(row)
     except BaseException:
         for p in sorted(tmp.glob("*")):
@@ -123,7 +146,7 @@ def main():
         tmp.rmdir()
         raise
     tmp.rename(out)
-    print(f"ASSEMBLED {len(tables)} tables from {len(selected)} batches")
+    print(f"ASSEMBLED {len(tables)} tables from {len(selected)} batches ({merged} aggregate-only reference duplicates merged)")
 
 
 if __name__ == "__main__":
