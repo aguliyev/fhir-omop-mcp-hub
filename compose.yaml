@@ -127,6 +127,17 @@ services:
     command: ["/webapi/register.sh"]
     restart: "no"
 
+  mcp_server:
+    build: ./mcp_server
+    platform: linux/amd64
+    depends_on:
+      ohdsi_webapi: {condition: service_healthy}
+      webapi_register: {condition: service_completed_successfully}
+    environment:
+      WEBAPI_BASE_URL: http://ohdsi_webapi:8080/WebAPI
+    ports: ["127.0.0.1:${MCP_HOST_PORT:-8000}:8000"]
+    restart: unless-stopped
+
 # Extensible: Task 5+ adds webapi/mcp services. Keep postgres/db_init unchanged.
 
 secrets:
