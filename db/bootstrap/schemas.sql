@@ -33,7 +33,9 @@ GRANT USAGE ON SCHEMA athena_vocabs TO vocab_reader;
 -- tables and the omop_csv_temp staging schema, and read vocabulary views.
 -- Never granted anything on athena_vocabs tables (denied by default); the
 -- password is set by run.sh from /run/secrets/etl_password, never here.
-GRANT USAGE ON SCHEMA omop_csv TO etl_loader;
+-- CREATE on omop_csv: ETL-Synthea builds runtime map helpers
+-- (source_to_standard_vocab_map, ...) in the CDM schema.
+GRANT USAGE, CREATE ON SCHEMA omop_csv TO etl_loader;
 GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
   ON ALL TABLES IN SCHEMA omop_csv TO etl_loader;
 ALTER DEFAULT PRIVILEGES FOR ROLE postgres, etl_loader IN SCHEMA omop_csv
