@@ -101,6 +101,8 @@ if "$REPO_ROOT/bin/validate-vocab" >/dev/null 2>&1; then ok "validate-vocab pass
 N1="$(dbq "SELECT count(*) FROM athena_vocabs.concept;" | tr -d ' \r\n')"
 case "$N1" in 5) ok "concept rows=$N1" ;; *) bad "concept rows (got '${N1:-empty}', want 5)"; N1="UNSET-BASELINE" ;; esac
 
+[ -z "$(dbq "SELECT coalesce(vocabulary_version,'') FROM athena_vocabs.vocabulary WHERE vocabulary_id='Cohort Type';" | tr -d ' \r\n')" ] && ok "empty upstream version loads as NULL" || bad "empty upstream version loads as NULL"
+
 for v in concept concept_ancestor concept_class concept_relationship concept_synonym domain drug_strength relationship source_to_concept_map vocabulary; do
   if [ "$(dbq "SELECT relkind FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='omop_csv' AND c.relname='$v';" | tr -d ' \r\n')" = "v" ]; then ok "view omop_csv.$v"; else bad "view omop_csv.$v"; fi
   if [ -z "$(dbq "SELECT to_regclass('omop_fhir.$v');" | tr -d ' \r\n')" ]; then ok "no omop_fhir.$v"; else bad "no omop_fhir.$v"; fi

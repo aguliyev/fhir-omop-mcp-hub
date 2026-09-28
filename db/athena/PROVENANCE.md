@@ -75,6 +75,14 @@ job must not create them.
    is the only writer and refuses any `VOCAB_VIEW_TARGET_SCHEMAS` value
    except the exact single identifier `omop_csv`; no views are ever
    created in `omop_fhir` (asserted by `validate.sql`).
+6. **`vocabulary_version` is nullable.** Upstream declares it `NOT NULL`,
+   but real Athena exports ship an empty `vocabulary_version` for
+   OMOP-generated vocabularies (e.g. Cohort Type, Concept Class, UB04
+   entries — 27 such rows in September 2026 exports), and `COPY ... CSV`
+   maps the unquoted empty field to `NULL`, so a verbatim schema rejects
+   real data (`null value in column "vocabulary_version" violates
+   not-null constraint`). The column is relaxed to `NULL`; views
+   (`SELECT *`) and `validate.sql` pass it through unchanged.
 
 ## Aggregate checksum convention
 

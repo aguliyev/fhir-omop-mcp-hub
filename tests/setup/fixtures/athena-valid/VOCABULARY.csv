@@ -4,3 +4,4 @@ LOINC	LOINC	http://example.invalid/loinc	2024-01-01	2
 RxNorm	RxNorm	http://example.invalid/rxnorm	2024-01-01	3
 SNOMED	SNOMED	http://example.invalid/snomed	2024-01-01	4
 UCUM	UCUM	http://example.invalid/ucum	2024-01-01	5
+Cohort Type	OMOP Cohort Type	OMOP generated		44819234
