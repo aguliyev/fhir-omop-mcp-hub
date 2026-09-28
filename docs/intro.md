@@ -1,28 +1,34 @@
-# FHIR-to-OMOP Ingestion & Cohort-Query MCP Server — Architecture
+# Synthea-to-OMOP (CSV-only v1) Ingestion & Cohort-Query MCP Server — Architecture
 
 ## 1. Purpose
 
-A reproducible local demonstration that transforms a fixed FHIR-formatted
+A reproducible local demonstration that transforms a fixed Synthea-generated
 clinical-data snapshot into an OMOP Common Data Model (CDM), using OHDSI's
 Athena vocabularies, and exposes the resulting OMOP data through MCP (Model
 Context Protocol) tools. The initial MCP capability is natural-language
 clinical cohort-definition queries; more tools may be added later.
 
+V1 scope: Synthea generates matching CSV and FHIR exports, but only the CSV
+export is imported into OMOP. FHIR is generated alongside CSV for batch parity
+and future use; FHIR-to-CDM loading is out of scope for v1.
+
 ## 2. Features (not the purpose — capabilities layered on top of it)
 
-- **Two setup paths.** Alongside the FHIR path (the system's core
-  purpose), a CSV-based path using ETL-Synthea demonstrates a second way to
-  ingest the same generated population. The paths remain isolated and can be
-  queried independently; automated comparison between them is not part of v1.
+- **CSV-only import in v1.** Synthea generates matching CSV and FHIR exports
+  for each synthetic-population batch, but v1 imports only the CSV path
+  (ETL-Synthea) into OMOP. FHIR batches are still generated and archived under
+  `fhir_input/` with the same batch identifier for parity and future converter
+  work; they are not loaded into any OMOP schema in v1. The FHIR-derived OMOP
+  source, its refresh pipeline, and any CSV/FHIR comparison are deferred.
 - **Synthetic data generation.** Synthea generates matching CSV and FHIR
   exports for each synthetic-population batch. It may run more than once;
   every run uses a unique recorded seed and publishes to both paths with the
-  same batch identifier. Successful batches are immutable accepted source
-  data. A later source refresh combines all previously accepted batches with
+  same batch identifier. Successful CSV batches are immutable accepted source
+  data. A later CSV refresh combines all previously accepted batches with
   the newly selected batches and treats their union as one complete input
   snapshot.
-- **Snapshot rebuilds.** ETL-Synthea and OHDSI FhirToCdm are treated as
-  initial-load tools. Re-running either path replaces that path's clinical
+- **Snapshot rebuilds.** ETL-Synthea is treated as
+  an initial-load tool. Re-running the CSV path replaces the CSV clinical
   OMOP data from a complete source snapshot; it does not append a delta. The
   converter is invoked once for the entire selected batch set, not once per
   batch.
@@ -31,6 +37,9 @@ clinical cohort-definition queries; more tools may be added later.
 
 ## 3. Non-goals (v1)
 
+- No FHIR import in v1. FHIR is generated alongside CSV but never loaded into
+  OMOP; `fhir_to_cdm`, the `omop_fhir` source, and its refresh flow are
+  deferred.
 - No write-back to OMOP via MCP.
 - No FHIR Subscriptions, streaming ingestion, or real-time push.
 - No effect-estimation or safety-signal comparison (drug A vs. drug B
@@ -55,10 +64,10 @@ clinical cohort-definition queries; more tools may be added later.
 | `postgres` | Persistent | Hosts the single `fhir_omop_mcp_hub` database and all schemas |
 | `db_init` | Setup/re-runnable batch | Applies versioned database DDL and grants, initializes source-specific schemas, and idempotently registers WebAPI sources and daimons from repository configuration. No manual database setup is required |
 | `athena_vocabs` | Batch, re-runnable | Loads a previously downloaded OHDSI Athena export into the `athena_vocabs` schema, then creates or recreates read-only compatibility views in configured target schemas. A refresh is a maintenance operation run while dependent ingestion and query services are stopped |
-| `synthea` | Batch, re-runnable | Generates matching CSV and FHIR outputs, assigns a shared batch ID and unique recorded seed, and publishes complete batch directories to `csv_input/inbox/` and `fhir_input/inbox/` |
-| `etl_synthea` | Setup/full-refresh batch | Claims one or more new CSV batches, combines them with all accepted CSV batches under `success/`, assembles the union as a complete snapshot, empties the CSV-derived physical clinical and helper tables in `omop_csv`, runs OHDSI ETL-Synthea once against the snapshot and vocabulary compatibility views, and accepts or rejects the new batches as one refresh set |
-| `fhir_to_cdm` | Setup/full-refresh batch | Claims one or more new FHIR batches, combines them with all accepted FHIR batches under `success/`, assembles the union as a complete snapshot, runs OHDSI FhirToCdm once to generate intermediate CDM files, replaces the physical clinical-table data in `omop_fhir`, and accepts or rejects the new batches as one refresh set |
-| `ohdsi_webapi` | Persistent | Provides vocabulary search and cohort-definition, generation, and execution endpoints. Registers `omop_csv` and `omop_fhir` as separate sources, gives each source separate results and temp schemas, and uses the shared `athena_vocabs` schema |
+| `synthea` | Batch, re-runnable | Generates matching CSV and FHIR outputs, assigns a shared batch ID and unique recorded seed, and publishes complete batch directories to `csv_input/inbox/` and `fhir_input/inbox/`. In v1 only the CSV output is consumed downstream |
+| `etl_synthea` | Setup/full-refresh batch | V1 load path. Claims one or more new CSV batches, combines them with all accepted CSV batches under `success/`, assembles the union as a complete snapshot, empties the CSV-derived physical clinical and helper tables in `omop_csv`, runs OHDSI ETL-Synthea once against the snapshot and vocabulary compatibility views, and accepts or rejects the new batches as one refresh set |
+| `fhir_to_cdm` | Deferred (not in v1) | FHIR-to-CDM conversion and load into `omop_fhir`. Retained in the architecture for a future converter selection; not built, run, or queried in v1 |
+| `ohdsi_webapi` | Persistent | Provides vocabulary search and cohort-definition, generation, and execution endpoints. In v1 registers only `omop_csv`; `omop_fhir` registration is deferred, and the shared `athena_vocabs` schema is used |
 | `mcp_server` | Persistent | Python MCP server and the primary deliverable. It exposes separate translation and execution tools plus a high-level tool that chains them |
 
 ## 5. Data flow
@@ -89,17 +98,15 @@ the physical CSV-derived clinical and helper tables in `omop_csv` → run
 ETL-Synthea once over the complete snapshot → move every new batch in the
 refresh set to `success/` or `rejected/`
 
-**FHIR branch:**
+**FHIR branch (deferred, not executed in v1):**
 
-selected `fhir_input/inbox/<batch_id>/` directories → `fhir_to_cdm` claims
-the new batches under `pending/` → assemble all `success/` batches plus the
-new `pending/` refresh set into one work directory → FhirToCdm runs once
-over the complete snapshot and writes intermediate files under the work
-directory → truncate or recreate the physical clinical tables in
-`omop_fhir` and load the generated snapshot → move every new batch in the
-refresh set to `success/` or `rejected/`
+selected `fhir_input/inbox/<batch_id>/` directories are archived for future
+use but no converter runs over them in v1 and nothing is loaded into
+`omop_fhir`. The FHIR refresh flow described below (claim → assemble snapshot
+→ FhirToCdm → load `omop_fhir` → accept/reject) is the deferred design, kept
+for converter reselection.
 
-**Query path:**
+**Query path (v1: `source_key` is always `omop_csv`):**
 
 User question + selected `source_key` → MCP high-level cohort query tool →
 translator → `ohdsi_webapi` vocabulary search → cohort-definition JSON →
@@ -113,23 +120,26 @@ different schemas to its CDM, vocabulary, results, and temporary daimons.
 
 | Schema | Role |
 |---|---|
-| `athena_vocabs` | Shared OMOP vocabulary tables used by both sources |
+| `athena_vocabs` | Shared OMOP vocabulary tables; in v1 used by the single `omop_csv` source |
 | `omop_csv` | OMOP CDM populated by `etl_synthea`; its standard vocabulary relations are read-only views into `athena_vocabs` |
 | `omop_csv_results` | WebAPI/Achilles results for the CSV source |
 | `omop_csv_temp` | WebAPI temporary workspace for the CSV source |
-| `omop_fhir` | OMOP CDM populated by `fhir_to_cdm` |
-| `omop_fhir_results` | WebAPI/Achilles results for the FHIR source |
-| `omop_fhir_temp` | WebAPI temporary workspace for the FHIR source |
+| `omop_fhir` | Deferred — reserved for future FHIR-derived CDM, not created or loaded in v1 |
+| `omop_fhir_results` | Deferred — not created in v1 |
+| `omop_fhir_temp` | Deferred — not created in v1 |
 | `ohdsi_webapi` | WebAPI application metadata, including source registrations and cohort definitions |
 
-WebAPI registers two sources:
+WebAPI registers one source in v1:
 
 | Source key | CDM | Vocabulary | Results | Temp |
 |---|---|---|---|---|
 | `omop_csv` | `omop_csv` | `athena_vocabs` | `omop_csv_results` | `omop_csv_temp` |
-| `omop_fhir` | `omop_fhir` | `athena_vocabs` | `omop_fhir_results` | `omop_fhir_temp` |
 
-The two sources do not share results or temp schemas. Results contain writable
+(`omop_fhir` + its results/temp schemas are the deferred design for a future
+converter selection.)
+
+The two-source layout above is the deferred design. In v1 there is only the
+`omop_csv` source, so no results/temp sharing question arises. Results contain writable
 cohort membership, inclusion statistics, Achilles characterization output,
 and WebAPI caches whose identifiers are meaningful only for one CDM source.
 After a clinical refresh, an old `person_id` may identify a different synthetic
@@ -142,14 +152,15 @@ cohort executions and any Achilles characterization must be run again.
 Temp schemas allow WebAPI to create and drop arbitrary intermediate objects;
 sharing one would risk name collisions between source jobs. With WebAPI jobs
 for the source stopped, the refreshed source's temp schema is dropped and
-recreated. The other source's results and temp schemas are not touched.
+recreated.
 
 ## 7. MCP server — tools (v1, extensible)
 
 1. **Translator** — extracts supported structured intent from natural
    language, calls WebAPI vocabulary search to resolve OMOP concept IDs, and
    returns inspectable cohort-definition JSON. It does not execute the cohort.
-2. **Executor** — accepts cohort-definition JSON and a `source_key`, invokes
+2. **Executor** — accepts cohort-definition JSON and a `source_key` (v1: only
+   `omop_csv`), invokes
    the required WebAPI cohort lifecycle, and returns structured results.
 3. **Cohort query** — convenient high-level tool that accepts a natural-
    language question and `source_key`, then chains the translator and executor
@@ -163,9 +174,9 @@ tool gives MCP clients a simple default path.
 
 Environment variable files live under `etc/`, one per service, with no
 hardcoded connection strings. All database-backed services connect to the
-`fhir_omop_mcp_hub` database. WebAPI contains both source registrations at the
-same time; the MCP request selects `omop_csv` or `omop_fhir` rather than
-reconfiguring or restarting WebAPI.
+`fhir_omop_mcp_hub` database. In v1 WebAPI contains only the `omop_csv`
+source registration; the MCP `source_key` is therefore always `omop_csv`
+(`omop_fhir` is deferred) rather than a choice between sources.
 
 The repository is the source of truth for setup. Declarative configuration,
 non-secret environment defaults, and WebAPI source definitions live under
@@ -175,9 +186,10 @@ statements live under `db/`. The `db_init` container applies them as part of
 are supplied through uncommitted local environment files or Docker secrets.
 
 The initial compatibility baseline is Synthea 3.3.0, ETL-Synthea 2.1.1, and
-OMOP CDM 5.3.1. The exact unmodified OHDSI FhirToCdm commit, supported FHIR
-format, runtime image, WebAPI version, PostgreSQL image digest, and platform
-constraints are pinned after the pre-development feasibility spike succeeds.
+OMOP CDM 5.3.1. WebAPI version, PostgreSQL image digest, and platform
+constraints are pinned during implementation. FHIR converter selection
+(FhirToCdm commit, FHIR format, runtime image, resource subset, loader
+contract) is deferred — see §12.
 
 The `athena_vocabs` service has an allow-listed configuration setting such as
 `VOCAB_VIEW_TARGET_SCHEMAS=omop_csv`. After successfully loading the physical
@@ -206,11 +218,9 @@ populate it through a separate controlled process.
 The target schemas exist before the vocabulary job runs, and their CDM
 initialization does not create physical tables with these names. The
 `etl_synthea` workflow skips `LoadVocabFromSchema`; its database role can read
-the views but cannot modify `athena_vocabs`. `omop_fhir` is not a configured
-view target because OHDSI FhirToCdm accepts the vocabulary connection and
-schema separately. A clinical refresh preserves both OMOP schemas. It therefore
-does not recreate the `omop_csv` vocabulary views, and `omop_fhir` has no such
-views to recreate. The views are recreated only when `athena_vocabs` itself is
+the views but cannot modify `athena_vocabs`. A clinical refresh preserves the
+OMOP schema. It therefore
+does not recreate the `omop_csv` vocabulary views. The views are recreated only when `athena_vocabs` itself is
 refreshed or their definitions change.
 
 Credentials must not be committed. The exact local secret-injection mechanism
@@ -218,8 +228,8 @@ is left to implementation planning.
 
 All operator actions are exposed as executable scripts under `bin/`. At
 minimum, the repository provides `setup`, `start`, `stop`, `restart`, `status`,
-`logs`, `generate`, `load-vocab`, `refresh-csv`, `refresh-fhir`, `refresh-all`,
-`validate`, and `reset`. These scripts are thin Docker Compose wrappers;
+`logs`, `generate`, `load-vocab`, `refresh-csv`, `validate`, and `reset`. (`refresh-fhir`
+and `refresh-all` are deferred with the FHIR path.) These scripts are thin Docker Compose wrappers;
 pipeline behavior remains inside the relevant container. Destructive commands
 such as `reset` require explicit confirmation.
 
@@ -255,14 +265,14 @@ One host directory is bind-mounted into participating containers at `/data`:
 
 Each inbox entry is a complete Synthea generation batch directory, never an
 individual CSV file from a multi-file export. Producers prepare the whole
-batch and publish it by an atomic directory rename. A refresh selects one or
-more matching new batch IDs and claims them by moving each whole directory to
-`pending/`. The work directory contains a refresh manifest and an assembled
+batch and publish it by an atomic directory rename. In v1 only the CSV tree is
+consumed: a refresh selects one or more new CSV batch IDs and claims them by
+moving each whole directory to `pending/`. The work directory contains a refresh manifest and an assembled
 snapshot made from all immutable batches already under `success/` plus the new
 `pending/` refresh set. CSV assembly writes one header per merged table and
-deduplicates shared reference entities; FHIR assembly flattens Bundle files
-under collision-free names because FhirToCdm does not recurse into batch
-subdirectories.
+deduplicates shared reference entities. The `fhir_input/` tree mirrors the same
+batch IDs for parity and future converter work but is not claimed, assembled,
+or loaded in v1.
 
 The converter is invoked once over the assembled snapshot. On success, every
 new batch in the refresh set moves to `success/` and becomes part of future
@@ -278,31 +288,31 @@ directories directly to the two inboxes.
 
 - The target is a reproducible local demonstration rather than a
   production-ready service.
-- A complete input snapshot may contain one or more Synthea generation batches.
-  Each batch has a unique recorded seed. Every refresh combines all accepted
+- A complete CSV input snapshot may contain one or more Synthea generation batches.
+  Each batch has a unique recorded seed. Every CSV refresh combines all accepted
   batches with its newly pending refresh set and passes the assembled snapshot
   to the converter in one invocation.
-- Each source is loaded from one complete snapshot during setup. A later
+- The CSV source is loaded from one complete snapshot during setup. A later
   refresh replaces that source's clinical data from another complete snapshot.
-- A clinical refresh preserves the `omop_csv` or `omop_fhir` schema itself and
-  truncates or recreates only that schema's physical clinical and helper tables.
-  Stable table definitions favor `TRUNCATE ... RESTART IDENTITY CASCADE`;
-  individual tables are recreated when their DDL changes.
+- A clinical refresh preserves the `omop_csv` schema itself and
+truncates or recreates only that schema's physical clinical and helper tables.
+Stable table definitions favor `TRUNCATE ... RESTART IDENTITY CASCADE`;
+individual tables are recreated when their DDL changes.
 - The `omop_csv` cleanup explicitly excludes its vocabulary views, so they
-  remain usable without recreation. `omop_fhir` has no vocabulary views.
+remain usable without recreation.
 - A source refresh drops and recreates that source's results schema using the
-  WebAPI-generated results DDL, and drops and recreates its disposable temp
-  schema. It leaves `ohdsi_webapi`, `athena_vocabs`, and the other source's
-  schemas untouched. WebAPI jobs for the source are stopped during this
-  operation.
+WebAPI-generated results DDL, and drops and recreates its disposable temp
+schema. It leaves `ohdsi_webapi` and `athena_vocabs`
+schemas untouched. WebAPI jobs for the source are stopped during this
+operation.
 - V1 performs an in-place maintenance refresh. MCP and WebAPI are stopped
   before clinical tables are cleared and restart only after loading and
   validation succeed. A failed refresh may leave empty or partial physical
   tables, but they are never exposed to query clients; the operator reruns the
   complete refresh. Atomic shadow-schema cutover is deferred.
-- ETL-Synthea's `row_number()` identifiers and OHDSI FhirToCdm's process-local
-  identifiers are acceptable only because their destination clinical tables
-  are rebuilt rather than appended.
+- ETL-Synthea's `row_number()` identifiers are acceptable only because the
+destination clinical tables
+are rebuilt rather than appended.
 - Processing errors move a batch to `rejected/`; v1 does not retry it
   automatically.
 - Recovery of abandoned `pending/` work after a crash is a future capability.
@@ -315,33 +325,36 @@ directories directly to the two inboxes.
 
 ## 11. Decisions made
 
-- The FHIR-to-OMOP-to-MCP system is the purpose; Synthea and the CSV branch are
-  supporting demonstration features.
+- V1 imports only CSV into OMOP (ETL-Synthea). FHIR is generated alongside CSV
+  with the same batch IDs for parity and future use but is not imported;
+  `fhir_to_cdm`, the `omop_fhir` source, and any CSV/FHIR comparison are
+  deferred after the failed FhirToCdm feasibility spike (see §12).
 - One PostgreSQL database, `fhir_omop_mcp_hub`, contains all schemas.
 - The shared vocabulary schema is named `athena_vocabs`.
-- The two OMOP CDM schemas are `omop_csv` and `omop_fhir`.
-- One WebAPI instance registers both OMOP schemas as separate sources.
-- Each source has its own results and temp schemas and shares
+- The v1 OMOP CDM schema is `omop_csv`; `omop_fhir` (+ results/temp) is reserved
+  for the deferred FHIR path.
+- One WebAPI instance registers the v1 `omop_csv` source (FHIR source deferred).
+- The CSV source has its own results and temp schemas and shares
   `athena_vocabs`.
 - One host data root is mounted at `/data` and contains both queue trees.
 - Queue entries are complete batch directories with
   `inbox/pending/success/rejected` states.
 - Synthea publishes directly to both inboxes and has no persistent directory.
+  Only `csv_input/` is consumed in v1; `fhir_input/` is archived batch parity.
 - Synthea may publish multiple batches. Each uses a unique recorded seed, and
-  a refresh processes all previously accepted batches plus one or more newly
-  selected batches as a single complete snapshot.
-- `fhir_to_cdm` is one setup/full-refresh container that performs conversion
-  followed by database loading.
-- Both data paths empty their source-specific physical clinical OMOP tables and
-  load a complete snapshot without dropping the enclosing OMOP schema; ongoing
-  append ingestion is deferred.
+a CSV refresh processes all previously accepted batches plus one or more newly
+selected batches as a single complete snapshot.
+- There is one v1 setup/full-refresh pipeline: `etl_synthea` (conversion
+  followed by database loading for CSV).
+- The CSV path empties its source-specific physical clinical OMOP tables and
+loads a complete snapshot without dropping the enclosing OMOP schema; ongoing
+append ingestion is deferred.
 - The `athena_vocabs` job creates and recreates configured compatibility views;
   initially only `omop_csv` is a view target.
-- Clinical refreshes retain the `omop_csv` vocabulary views. `omop_fhir` uses
-  `athena_vocabs` directly and has no local vocabulary views.
+- Clinical refreshes retain the `omop_csv` vocabulary views.
 - A clinical refresh drops and recreates only the refreshed source's results
-  and temp schemas; WebAPI metadata, source/daimon registrations, and cohort
-  definitions remain in `ohdsi_webapi`.
+and temp schemas; WebAPI metadata, source/daimon registrations, and cohort
+definitions remain in `ohdsi_webapi`.
 - Repository configuration under `etc/` and versioned database assets under
   `db/` drive an idempotent `db_init` setup job; PostgreSQL requires no manual
   configuration.
@@ -351,11 +364,12 @@ directories directly to the two inboxes.
   `127.0.0.1` by default.
 - The compatibility baseline is Synthea 3.3.0, ETL-Synthea 2.1.1, and OMOP
   CDM 5.3.1. The feasibility spike pins the remaining compatible versions.
-- WebAPI source keys are lowercase snake case: `omop_csv` and `omop_fhir`.
+- WebAPI source keys are lowercase snake case: `omop_csv` in v1 (`omop_fhir`
+reserved for the deferred FHIR path).
 - No automated CSV/FHIR comparison is required.
 - MCP exposes translator, executor, and chained cohort-query tools.
-- Exact FHIR compatibility is discovered and documented while implementing
-  the FhirToCdm integration.
+- FHIR converter reselection (exact FHIR compatibility, loader contract) is
+  future work after v1; do not commit to a FhirToCdm integration plan.
 
 ## 12. Left for implementation planning
 
@@ -374,19 +388,20 @@ directories directly to the two inboxes.
   Athena vocabularies, but its R4-only parser rejects STU3 and its
   SNOMED/RxNorm/CVX/LOINC-only mapping throws on default Synthea 3.3.0 output
   (CDT procedures, ICD-10 conditions). Do not patch or fork FhirToCdm; reopen
-  converter selection before any FHIR-path main-plan commitment.
-- After the spike, record the verified FhirToCdm commit, FHIR format, runtime
-  image, supported resource subset, loader contract, and platform constraints.
-- Define the exact setup/full-refresh command sequence and failure reporting
+  converter selection before any FHIR-path main-plan commitment. V1 consequence:
+  FHIR generation stays, FHIR import is out of scope; only CSV is loaded.
+- FHIR converter reselection (verified commit, FHIR format, runtime image,
+  supported resource subset, loader contract, platform constraints) is deferred
+  past v1 and is not a v1 implementation-planning item.
+- Define the exact CSV setup/full-refresh command sequence and failure reporting
   for the agreed in-place maintenance refresh.
-- Define how each source refresh atomically selects and claims new batch IDs,
+- Define how the CSV refresh atomically selects and claims new batch IDs,
   assembles its accepted-plus-pending snapshot, and records that selection in
-  a refresh manifest. `refresh-all` may coordinate matching Synthea batch IDs,
-  but the CSV and FHIR sources remain independently refreshable.
+  a refresh manifest.
 - Define Docker Compose services, networks, initialization jobs, startup order,
   and health checks.
-- Generate and initialize the two WebAPI results schemas and source/daimon
-  registrations.
+- Generate and initialize the v1 WebAPI results schema and source/daimon
+  registration (`omop_csv` only).
 - Define the Athena vocabulary-view publisher configuration, identifier
   allow-list validation, grants, and post-refresh checks.
 - Define batch naming, the minimal batch manifest, and error-report format.
