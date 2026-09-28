@@ -38,6 +38,7 @@ services:
     volumes:
       - ${DATA_ROOT:-./data}:/data
       - ./db/bootstrap:/bootstrap:ro
+      - ./db/webapi:/webapi:ro
     secrets:
       - postgres_password
       - etl_password
