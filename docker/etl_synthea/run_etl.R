@@ -24,7 +24,10 @@ cd <- DatabaseConnector::createConnectionDetails(
   port = pg_port,
   pathToDriver = "/opt/jdbc"
 )
-rm(etl_pw, secret_lines)
+# Do NOT rm() the secret: DatabaseConnector captures connection arguments
+# lazily and evaluates them in a separate thread at connect() time, so
+# scrubbing etl_pw here breaks every connection with an evaluation error.
+# The secret lives only in this one-shot container's memory.
 
 cdm_schema <- "omop_csv"
 staging_schema <- "omop_csv_temp"
